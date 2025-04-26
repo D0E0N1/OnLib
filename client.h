@@ -65,6 +65,18 @@ public:
     void importBooksCsv(const QString& csvData);
     void exportBooksCsv();
 
+    // Новые методы для управления пользователями
+    void blockUser(int user_id);
+    void unblockUser(int user_id);
+    void resetUserPassword(int user_id, const QString& new_password);
+    void updateUserEmail(int user_id, const QString& new_email);
+
+    // Новый метод для запроса истории аренды
+    void viewRentalHistory();
+
+    // Новый метод для запроса статистики
+    void getLibraryStats();
+
 signals:
     void publicUserInfoReceived(int id, const QString& login, const QString& email);
     void booksListReceived(const QStringList& books);
@@ -80,6 +92,13 @@ signals:
     void allUsersListReceived(const QStringList& users); // Список строк "id,login"
 
     void exportCsvDataReceived(const QString& csvData);
+
+    // Новый сигнал для истории аренды
+    void rentalHistoryReceived(const QStringList& history);
+
+    // Новый сигнал для статистики
+    void libraryStatsReceived(int totalBooks, int availableBooks, int rentedBooks,
+                              int totalClients, int activeRentals, int overdueRentals);
 
 private slots:
     void onReadyRead();

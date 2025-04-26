@@ -83,6 +83,20 @@ private slots: // Слоты для обработки сигналов (нап�
 
     void onThemeChangeToggled(bool checked);
 
+    // Новые слоты для кнопок управления пользователями
+    void onBlockUserClicked();
+    void onUnblockUserClicked();
+    void onResetPasswordClicked();
+    void onChangeEmailClicked();
+
+    // Новые слоты для истории аренды клиента
+    void onClientViewHistoryClicked();
+    void handleRentalHistory(const QStringList& history);
+
+    // Новые слоты для статистики
+    void onRefreshStatsClicked();
+    void handleLibraryStats(int totalBooks, int availableBooks, int rentedBooks,
+                            int totalClients, int activeRentals, int overdueRentals);
 
 private: // Приватные методы и члены класса
 
@@ -103,6 +117,12 @@ private: // Приватные методы и члены класса
 
     // Новый метод для заполнения таблицы пользователей
     void populateUsersTable(const QStringList& users);
+
+    // Новый метод для заполнения таблицы истории
+    void populateHistoryTable(const QStringList& history);
+
+
+    int getSelectedUserIdFromTable(QTableWidget* table);
 
     // --- UI Member Variables ---
     QStackedWidget *mStackedWidget; // Виджет для переключения экранов
@@ -199,6 +219,27 @@ private: // Приватные методы и члены класса
     QMenuBar *mMenuBar;
     QMenu *mViewMenu;
     QAction *mThemeAction;
+
+    // Новые кнопки управления пользователями
+    QPushButton *mBlockUserButton;
+    QPushButton *mUnblockUserButton;
+    QPushButton *mResetPasswordButton;
+    QPushButton *mChangeEmailButton;
+
+    // Новые элементы для истории на экране клиента
+    QGroupBox    *mClientHistoryGroup; // Опционально, для группировки
+    QTableWidget *mClientHistoryTable;
+    QPushButton  *mClientViewHistoryButton;
+
+    // Члены UI для статистики
+    QGroupBox   *mStatsGroup; // Группа для статистики
+    QLabel      *mTotalBooksLabel;
+    QLabel      *mAvailableBooksLabel;
+    QLabel      *mRentedBooksLabel;
+    QLabel      *mTotalClientsLabel;
+    QLabel      *mActiveRentalsLabel;
+    QLabel      *mOverdueRentalsLabel;
+    QPushButton *mRefreshStatsButton;
 
 };
 
