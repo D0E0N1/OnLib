@@ -1,6 +1,9 @@
 #include "commandhandler.h"
 #include "database.h"
 #include <QDebug>
+#include <QCryptographicHash> // Добавить для хеширования пароля
+#include <QRandomGenerator>   // Добавить для генерации случайного пароля
+#include <QRegularExpression> // Добавить для валидации Email
 
 CommandHandler::CommandHandler() {}
 QString CommandHandler::handleRequest(const QString& command,
@@ -38,6 +41,25 @@ QString CommandHandler::handleRequest(const QString& command,
         }
         else if (command == "search_books") {
             return handleSearchBooks(parts);
+        }else if (command == "get_rental_history") {
+            if (clientUserId == -1) return "error&Authentication required\r\n";
+            // Дополнительная проверка, что запрашивают свою историю
+            if (parts.size() == 2) {
+                bool ok;
+                int requestedUserId = parts.at(1).toInt(&ok);
+                if (ok && requestedUserId == clientUserId) {
+                    return handleGetRentalHistory(parts);
+                } else {
+                    qWarning() << "Security Alert: User" << clientUserId << "attempted to access history for user" << parts.value(1);
+                    return "error&Access denied\r\n"; // Запрет просмотра чужой истории
+                }
+            } else {
+                return "error&Invalid parameters for get_rental_history (expected user_id)\r\n";
+            }
+        } else if (command == "get_library_stats") {
+            if (clientRole != "librarian") return "error&Permission denied\r\n";
+            if (clientUserId == -1) return "error&Authentication required\r\n";
+            return handleGetLibraryStats(parts);
         }else if (command == "get_all_users") {
             // Проверка аутентификации И роли здесь
             if (clientUserId == -1) return "error&Authentication required\r\n";
@@ -116,6 +138,18 @@ QString CommandHandler::handleRequest(const QString& command,
             database& db = database::get_instance();
             QStringList debts = db.getAllDebts();
             return QString("all_debts+&%1\r\n").arg(debts.join("|"));
+        } else if (command == "block_user") {
+            if (clientRole != "librarian") return "error&Permission denied\r\n";
+            return handleBlockUser(parts);
+        } else if (command == "unblock_user") {
+            if (clientRole != "librarian") return "error&Permission denied\r\n";
+            return handleUnblockUser(parts);
+        } else if (command == "reset_user_password") {
+            if (clientRole != "librarian") return "error&Permission denied\r\n";
+            return handleResetUserPassword(parts);
+        } else if (command == "update_user_email") {
+            if (clientRole != "librarian") return "error&Permission denied\r\n";
+            return handleUpdateUserEmail(parts);
         }
 
         return "error&Unknown command\r\n";
@@ -520,4 +554,124 @@ QString CommandHandler::handleImportBooksCsv(const QStringList& parts) {
     } else {
         return QString("import_books+&%1\r\n").arg(summary);
     }
+}
+
+// Блокировка пользователя
+QString CommandHandler::handleBlockUser(const QStringList& parts) {
+    if (parts.size() != 2) return "error&Invalid parameters for block_user\r\n";
+    bool ok;
+    int user_id = parts[1].toInt(&ok);
+    if (!ok || user_id <= 0) return "error&Invalid user ID format\r\n";
+
+    database& db = database::get_instance();
+    if (db.setUserStatus(user_id, "blocked")) {
+        return QString("block_user+&%1\r\n").arg(user_id);
+    } else {
+        // Попытка определить причину (пользователь не найден?)
+        return "block_user-&Failed to block user (not found?)\r\n";
+    }
+}
+
+// Разблокировка пользователя
+QString CommandHandler::handleUnblockUser(const QStringList& parts) {
+    if (parts.size() != 2) return "error&Invalid parameters for unblock_user\r\n";
+    bool ok;
+    int user_id = parts[1].toInt(&ok);
+    if (!ok || user_id <= 0) return "error&Invalid user ID format\r\n";
+
+    database& db = database::get_instance();
+    if (db.setUserStatus(user_id, "active")) {
+        return QString("unblock_user+&%1\r\n").arg(user_id);
+    } else {
+        return "unblock_user-&Failed to unblock user (not found?)\r\n";
+    }
+}
+
+// Сброс/Установка пароля пользователя Библиотекарем
+QString CommandHandler::handleResetUserPassword(const QStringList& parts) {
+    if (parts.size() != 3) return "error&Invalid parameters for reset_user_password (expected id&new_password)\r\n";
+    bool ok;
+    int user_id = parts[1].toInt(&ok);
+    if (!ok || user_id <= 0) return "error&Invalid user ID format\r\n";
+    QString newPassword = parts[2]; // Пароль от клиента
+
+    // Валидация пароля
+    if (newPassword.length() < 8 || newPassword.length() > 12 || !QRegularExpression("^[a-zA-Z0-9!@#$%^&*()_+-=]+$").match(newPassword).hasMatch()) {
+        return "reset_password-&New password does not meet requirements (8-12 chars, lat/num/symbols)\r\n";
+    }
+
+    database& db = database::get_instance();
+    // Передаем ОРИГИНАЛЬНЫЙ ПАРОЛЬ в метод БД
+    if (db.resetUserPassword(user_id, newPassword)) {
+        qDebug() << "Successfully set new PLAIN TEXT password for user" << user_id;
+        return QString("reset_password+&%1&Password successfully set.\r\n").arg(user_id);
+    } else {
+        return "reset_password-&Failed to set new password (user not found? DB error?)\r\n";
+    }
+}
+
+// Обновление email пользователя
+QString CommandHandler::handleUpdateUserEmail(const QStringList& parts) {
+    if (parts.size() != 3) return "error&Invalid parameters for update_user_email (expected id&email)\r\n";
+    bool ok;
+    int user_id = parts[1].toInt(&ok);
+    if (!ok || user_id <= 0) return "error&Invalid user ID format\r\n";
+    QString new_email = parts[2].trimmed();
+
+    // Серверная валидация email
+    static const QRegularExpression emailRegex("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    if (!emailRegex.match(new_email).hasMatch()) {
+        return "error&Invalid email format\r\n";
+    }
+
+    database& db = database::get_instance();
+    if (db.updateUserEmail(user_id, new_email)) {
+        return QString("update_email+&%1\r\n").arg(user_id);
+    } else {
+        // Пытаемся понять причину: возможно, email уже занят?
+        // (updateUserEmail сама проверяет уникальность)
+        return "update_email-&Failed to update email (user not found or email taken?)\r\n";
+    }
+}
+
+// Обработчик запроса истории аренды
+QString CommandHandler::handleGetRentalHistory(const QStringList& parts) {
+    // Проверку прав (что юзер запрашивает свою историю) уже сделали в handleRequest
+    if (parts.size() != 2) return "error&Internal: Invalid parameters in handleGetRentalHistory\r\n"; // Не должно случиться
+    bool ok;
+    int user_id = parts[1].toInt(&ok);
+    if (!ok || user_id <= 0) return "error&Internal: Invalid user ID format in handleGetRentalHistory\r\n"; // Не должно случиться
+
+    database& db = database::get_instance();
+    QStringList history = db.getUserRentalHistory(user_id);
+
+    return QString("rental_history+&%1\r\n").arg(history.join("|"));
+}
+
+// Обработчик запроса статистики библиотеки
+QString CommandHandler::handleGetLibraryStats(const QStringList& parts) {
+    Q_UNUSED(parts); // Параметры не нужны
+
+    database& db = database::get_instance();
+
+    int totalBooks = db.getTotalBookCount();
+    int availableBooks = db.getAvailableBookCount();
+    int rentedBooks = (totalBooks >= 0 && availableBooks >= 0) ? (totalBooks - availableBooks) : -1; // Вычисляем, если данные корректны
+    int totalClients = db.getTotalClientCount();
+    int activeRentals = db.getActiveRentalCount();
+    int overdueRentals = db.getOverdueRentalCount();
+
+    // Проверка на ошибки получения данных (-1)
+    if (totalBooks < 0 || availableBooks < 0 || totalClients < 0 || activeRentals < 0 || overdueRentals < 0) {
+        return "error&Failed to retrieve some statistics from DB\r\n";
+    }
+
+    // Формат ответа: library_stats+&total&available&rented&clients&active_rentals&overdue_rentals
+    return QString("library_stats+&%1&%2&%3&%4&%5&%6\r\n")
+        .arg(totalBooks)
+        .arg(availableBooks)
+        .arg(rentedBooks)
+        .arg(totalClients)
+        .arg(activeRentals)
+        .arg(overdueRentals);
 }

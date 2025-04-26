@@ -38,7 +38,8 @@ bool database::create_tables() {
                           "login TEXT UNIQUE NOT NULL, "
                           "password TEXT NOT NULL, "
                           "email TEXT NOT NULL, "
-                          "role TEXT NOT NULL)");
+                          "role TEXT NOT NULL, "
+                          "status TEXT DEFAULT 'active')"); // Новый столбец
 
     // Books table with genre
     success &= query.exec("CREATE TABLE IF NOT EXISTS books ("
@@ -60,16 +61,27 @@ bool database::create_tables() {
                           "FOREIGN KEY(user_id) REFERENCES users(id), "
                           "FOREIGN KEY(book_id) REFERENCES books(id))");
 
+
+    // Новая таблица для ИСТОРИИ аренды
+    success &= query.exec("CREATE TABLE IF NOT EXISTS rental_history ("
+                          "id INTEGER PRIMARY KEY AUTOINCREMENT, "        // ID записи истории
+                          "user_id INTEGER NOT NULL, "
+                          "book_id INTEGER NOT NULL, "
+                          "start_date TEXT NOT NULL, "                  // Дата начала аренды
+                          "end_date TEXT NOT NULL, "                    // ПЛАНОВАЯ дата возврата
+                          "return_date TEXT NOT NULL, "                 // ФАКТИЧЕСКАЯ дата возврата
+                          "FOREIGN KEY(user_id) REFERENCES users(id), "
+                          "FOREIGN KEY(book_id) REFERENCES books(id))");
+
     if (!success) {
         qDebug() << "Error creating/updating tables:" << query.lastError();
-        // ★ Попытка добавить столбец, если таблица уже существует
-        if (!query.exec("ALTER TABLE books ADD COLUMN annotation TEXT DEFAULT ''")) {
-            qDebug() << "Failed to add annotation column:" << query.lastError();
-                // Это не фатальная ошибка, если таблица уже была с колонкой
+            // Попытка добавить столбец status, если таблица уже существует
+        if (!query.exec("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'")) {
+            qDebug() << "Failed to add status column to users table (might already exist):" << query.lastError();
         } else {
-            qDebug() << "Successfully added 'annotation' column to 'books' table.";
+            qDebug() << "Successfully added 'status' column to 'users' table.";
         }
-        success = true; // Продолжаем работу, даже если alter table не удался (мог уже существовать)
+        success = true; // Продолжаем работу
     }
     return success;
 }
@@ -77,7 +89,8 @@ bool database::create_tables() {
 // Common methods
 bool database::authenticateUser(const QString& login, const QString& password) {
     QSqlQuery query;
-    query.prepare("SELECT password FROM users WHERE login = :login");
+        // Выбираем пароль и статус
+    query.prepare("SELECT password, status FROM users WHERE login = :login");
     query.bindValue(":login", login);
 
     if (!query.exec()) {
@@ -87,9 +100,19 @@ bool database::authenticateUser(const QString& login, const QString& password) {
 
     if (query.next()) {
         QString dbPassword = query.value(0).toString();
-        return (dbPassword == password);
+        QString dbStatus = query.value(1).toString();
+            // Проверяем и пароль, и статус
+
+        qDebug() << "Authenticating user:" << login;
+        qDebug() << "  DB Password (Plain) :" << dbPassword;
+        qDebug() << "  Input Password (Plain):" << password;
+        qDebug() << "  DB Status           :" << dbStatus;
+        qDebug() << "  Password Match      :" << (dbPassword == password);
+        qDebug() << "  Status Match        :" << (dbStatus == "active");
+
+        return (dbPassword == password && dbStatus == "active");
     }
-    return false;
+    return false; // Пользователь не найден
 }
 
 int database::getUserID(const QString& login) {
@@ -302,20 +325,72 @@ bool database::assignBookToUser(int user_id, int book_id) {
 bool database::unassignBookFromUser(int user_id, int book_id) {
     if (!userExists(user_id)) return false;
 
-    QSqlQuery query;
-    query.prepare("DELETE FROM rentals WHERE user_id = :user_id AND book_id = :book_id");
-    query.bindValue(":user_id", user_id);
-    query.bindValue(":book_id", book_id);
+    QSqlDatabase::database().transaction(); // ★ Начинаем транзакцию ★
 
-    if (!query.exec()) {
-        qDebug() << "Error unassigning book:" << query.lastError().text();
+    // 1. Получаем данные УДАЛЯЕМОЙ аренды
+    QSqlQuery selectQuery;
+    selectQuery.prepare("SELECT start_date, end_date FROM rentals "
+                        "WHERE user_id = :user_id AND book_id = :book_id");
+    selectQuery.bindValue(":user_id", user_id);
+    selectQuery.bindValue(":book_id", book_id);
+
+    QString startDate, endDate;
+    if (selectQuery.exec() && selectQuery.next()) {
+        startDate = selectQuery.value(0).toString();
+        endDate = selectQuery.value(1).toString();
+    } else {
+        qWarning() << "Rental record not found for user" << user_id << "book" << book_id << "Cannot move to history.";
+        QSqlDatabase::database().rollback(); // Откатываем транзакцию
+        return false; // Аренда не найдена, нечего перемещать/удалять
+    }
+
+    // 2. Вставляем запись в ИСТОРИЮ с текущей датой возврата
+    QSqlQuery insertHistoryQuery;
+    insertHistoryQuery.prepare("INSERT INTO rental_history (user_id, book_id, start_date, end_date, return_date) "
+                               "VALUES (:user_id, :book_id, :start_date, :end_date, DATE('now'))");
+    insertHistoryQuery.bindValue(":user_id", user_id);
+    insertHistoryQuery.bindValue(":book_id", book_id);
+    insertHistoryQuery.bindValue(":start_date", startDate);
+    insertHistoryQuery.bindValue(":end_date", endDate); // Сохраняем плановую дату
+
+    if (!insertHistoryQuery.exec()) {
+        qDebug() << "Error moving rental to history:" << insertHistoryQuery.lastError().text();
+        QSqlDatabase::database().rollback(); // Откатываем транзакцию
+        return false;
+    }
+    qDebug() << "Moved rental to history for user" << user_id << "book" << book_id;
+
+    // 3. Удаляем запись из АКТИВНЫХ аренд
+    QSqlQuery deleteQuery;
+    deleteQuery.prepare("DELETE FROM rentals WHERE user_id = :user_id AND book_id = :book_id");
+    deleteQuery.bindValue(":user_id", user_id);
+    deleteQuery.bindValue(":book_id", book_id);
+
+    if (!deleteQuery.exec()) {
+        qDebug() << "Error deleting from active rentals after moving to history:" << deleteQuery.lastError().text();
+        QSqlDatabase::database().rollback(); // Откатываем транзакцию
         return false;
     }
 
-    // Mark book as available
-    query.prepare("UPDATE books SET is_available = 1 WHERE id = :book_id");
-    query.bindValue(":book_id", book_id);
-    return query.exec();
+    // 4. Делаем книгу снова доступной
+    QSqlQuery updateBookQuery;
+    updateBookQuery.prepare("UPDATE books SET is_available = 1 WHERE id = :book_id");
+    updateBookQuery.bindValue(":book_id", book_id);
+
+    if (!updateBookQuery.exec()) {
+        qDebug() << "Error updating book status after unassign:" << updateBookQuery.lastError().text();
+        QSqlDatabase::database().rollback(); // Откатываем транзакцию
+        return false;
+    }
+
+    // ★ Фиксируем транзакцию, если все успешно ★
+    if (!QSqlDatabase::database().commit()) {
+        qDebug() << "Transaction commit failed during unassign!";
+        QSqlDatabase::database().rollback(); // Попытка отката при ошибке commit
+        return false;
+    }
+
+    return true; // Все шаги прошли успешно
 }
 
 QStringList database::getUserDebts(int user_id) {
@@ -547,7 +622,8 @@ bool database::updateBookAnnotation(int book_id, const QString& annotation) {
 QStringList database::getAllUsers() {
     QStringList users;
     // ИЗМЕНЕН ЗАПРОС: Добавлено условие WHERE role = 'client'
-    QSqlQuery query("SELECT id, login FROM users WHERE role = 'client' ORDER BY login ASC");
+    QSqlQuery query("SELECT id, login, status FROM users WHERE role = 'client' ORDER BY login ASC");
+
 
     if (!query.exec()) {
         qDebug() << "Error getting client users:" << query.lastError().text();
@@ -555,9 +631,160 @@ QStringList database::getAllUsers() {
     }
 
     while (query.next()) {
-        users << QString("%1,%2")
-        .arg(query.value(0).toString()) // id
-            .arg(query.value(1).toString()); // login
+        // ★ Добавляем статус в формируемую строку ★
+        users << QString("%1,%2,%3")
+                     .arg(query.value(0).toString()) // id
+                     .arg(query.value(1).toString()) // login
+                     .arg(query.value(2).toString()); // status
     }
     return users;
+}
+
+// Обновление статуса пользователя
+bool database::setUserStatus(int user_id, const QString& status) {
+    if (status != "active" && status != "blocked") {
+        qWarning() << "Invalid status provided to setUserStatus:" << status;
+        return false;
+    }
+    QSqlQuery query;
+    query.prepare("UPDATE users SET status = :status WHERE id = :user_id");
+    query.bindValue(":status", status);
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) {
+        qDebug() << "Error updating user status:" << query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0; // Возвращаем true, если строка была обновлена
+}
+
+// Обновление (сброс) пароля пользователя (принимает хеш)
+bool database::resetUserPassword(int user_id, const QString& new_password) { // ★ Сигнатура изменена ★
+    QSqlQuery query;
+    query.prepare("UPDATE users SET password = :password WHERE id = :user_id");
+    query.bindValue(":password", new_password); // ★ Сохраняем пароль как есть ★
+    query.bindValue(":user_id", user_id);
+    qDebug() << "Executing password reset query for user ID:" << user_id;
+    if (!query.exec()) {
+        qDebug() << "!!! SQL Error resetting password:" << query.lastError().text();
+        return false;
+    }
+    qDebug() << "Password reset query executed. Rows affected:" << query.numRowsAffected();
+    return query.numRowsAffected() > 0;
+}
+// Обновление email пользователя с проверкой уникальности
+bool database::updateUserEmail(int user_id, const QString& new_email) {
+    // 1. Проверка, не занят ли новый email другим пользователем
+    QSqlQuery checkQuery;
+    checkQuery.prepare("SELECT id FROM users WHERE email = :email AND id != :user_id");
+    checkQuery.bindValue(":email", new_email);
+    checkQuery.bindValue(":user_id", user_id);
+    if (!checkQuery.exec()) {
+        qDebug() << "Email uniqueness check failed:" << checkQuery.lastError().text();
+        return false; // Ошибка проверки
+    }
+    if (checkQuery.next()) {
+        qDebug() << "Email already taken by another user:" << new_email;
+        return false; // Email занят
+    }
+
+    // 2. Если email свободен, обновляем
+    QSqlQuery updateQuery;
+    updateQuery.prepare("UPDATE users SET email = :email WHERE id = :user_id");
+    updateQuery.bindValue(":email", new_email);
+    updateQuery.bindValue(":user_id", user_id);
+    if (!updateQuery.exec()) {
+        qDebug() << "Error updating user email:" << updateQuery.lastError().text();
+        return false;
+    }
+    return updateQuery.numRowsAffected() > 0;
+}
+
+// Получение текущего статуса пользователя
+QString database::getUserStatus(int user_id) {
+    QSqlQuery query;
+    query.prepare("SELECT status FROM users WHERE id = :user_id");
+    query.bindValue(":user_id", user_id);
+    if (query.exec() && query.next()) {
+        return query.value(0).toString();
+    }
+    return ""; // Или какое-то значение по умолчанию/ошибки
+}
+
+
+// Реализация метода получения ИСТОРИИ аренды пользователя
+QStringList database::getUserRentalHistory(int user_id) {
+    QStringList historyList;
+    QSqlQuery query;
+    // Выбираем ID истории, Название книги, Даты начала, планового конца и фактического возврата
+    query.prepare("SELECT rh.id, b.title, rh.start_date, rh.end_date, rh.return_date "
+                  "FROM rental_history rh "
+                  "JOIN books b ON rh.book_id = b.id "
+                  "WHERE rh.user_id = :user_id "
+                  "ORDER BY rh.return_date DESC"); // Сортируем по дате возврата (последние сверху)
+    query.bindValue(":user_id", user_id);
+
+    if (!query.exec()) {
+        qDebug() << "Error getting user rental history:" << query.lastError().text();
+        return historyList;
+    }
+
+    while (query.next()) {
+        historyList << QString("%1,%2,%3,%4,%5")
+        .arg(query.value(0).toString()) // history id
+            .arg(query.value(1).toString()) // book title
+            .arg(query.value(2).toString()) // start date
+            .arg(query.value(3).toString()) // scheduled end date
+            .arg(query.value(4).toString()); // actual return date
+    }
+    return historyList;
+}
+
+// Получение общего количества книг
+int database::getTotalBookCount() {
+    QSqlQuery query("SELECT COUNT(*) FROM books");
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    qWarning() << "Failed to get total book count:" << query.lastError();
+    return -1; // Ошибка
+}
+
+// Получение количества доступных книг
+int database::getAvailableBookCount() {
+    QSqlQuery query("SELECT COUNT(*) FROM books WHERE is_available = 1");
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    qWarning() << "Failed to get available book count:" << query.lastError();
+    return -1; // Ошибка
+}
+
+// Получение общего количества клиентов
+int database::getTotalClientCount() {
+    QSqlQuery query("SELECT COUNT(*) FROM users WHERE role = 'client'");
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    qWarning() << "Failed to get total client count:" << query.lastError();
+    return -1; // Ошибка
+}
+
+// Получение количества активных аренд
+int database::getActiveRentalCount() {
+    QSqlQuery query("SELECT COUNT(*) FROM rentals");
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    qWarning() << "Failed to get active rental count:" << query.lastError();
+    return -1; // Ошибка
+}
+
+// Получение количества просроченных аренд
+int database::getOverdueRentalCount() {
+    QSqlQuery query("SELECT COUNT(*) FROM rentals WHERE DATE(end_date) < DATE('now')");
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    qWarning() << "Failed to get overdue rental count:" << query.lastError();
+    return -1; // Ошибка
 }

@@ -20,7 +20,10 @@
 #include <QAction>
 #include <QSettings>
 
-extern void applyTheme(bool useDark); // ★ Объявляем внешнюю функцию
+#include <QInputDialog>   // Для запроса email
+#include <QRegularExpressionValidator> // Для валидации email в диалоге
+
+extern void applyTheme(bool useDark); // Объявляем внешнюю функцию
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -87,6 +90,12 @@ MainWindow::MainWindow(QWidget *parent)
     // Connect для CSV экспорта
     connect(&Client::get_instance(), &Client::exportCsvDataReceived,
             this, &MainWindow::handleExportCsvData);
+    // Connect для истории аренды
+    connect(&Client::get_instance(), &Client::rentalHistoryReceived,
+            this, &MainWindow::handleRentalHistory);
+    // Connect для статистики
+    connect(&Client::get_instance(), &Client::libraryStatsReceived,
+            this, &MainWindow::handleLibraryStats);
 
     // 8. Установка начального экрана
     mStackedWidget->setCurrentWidget(mMainScreen);
@@ -175,6 +184,8 @@ void MainWindow::onBackButtonClicked() {
     if(mClientAllBooksTable) mClientAllBooksTable->setRowCount(0);
     if(mLibrarianBooksTable) mLibrarianBooksTable->setRowCount(0);
     if(mLibrarianDebtsTable) mLibrarianDebtsTable->setRowCount(0);
+    if(mLibrarianUsersTable) mLibrarianUsersTable->setRowCount(0);
+    if(mClientHistoryTable) mClientHistoryTable->setRowCount(0);
 
     // Очистка лога сервера и переход на главный экран
     mResponseTextEdit->clear();
@@ -435,6 +446,7 @@ void MainWindow::handleOperationStatus(bool success, const QString& message) {
     bool needsLibrarianBooksUpdate = false;
     bool needsLibrarianDebtsUpdate = false;
     bool needsClientBookStatsUpdate = false;
+    bool needsUserListUpdate = false; // Флаг для обновления списка юзеров
     bool loginSuccessful = false; // Флаг успешного логина
 
     if (success) {
@@ -465,12 +477,14 @@ void MainWindow::handleOperationStatus(bool success, const QString& message) {
                         // ★ ЗАПРОСЫ ДАННЫХ ПОСЛЕ ПЕРЕКЛЮЧЕНИЯ ★
                     Client::get_instance().viewBookStats();
                     Client::get_instance().viewAllBooks();
+                    Client::get_instance().viewRentalHistory();
                 } else if (role == "librarian") {
                     mStackedWidget->setCurrentWidget(mLibrarianScreen);
                     // ★ ЗАПРОСЫ ДАННЫХ ПОСЛЕ ПЕРЕКЛЮЧЕНИЯ ★
                     onRefreshBooksClicked();
                     onRefreshDebtsClicked();
                     onRefreshUsersClicked();
+                    onRefreshStatsClicked();
                 } else {
                     qWarning() << "Unknown role after authentication:" << role;
                     mStackedWidget->setCurrentWidget(mMainScreen);
@@ -497,6 +511,21 @@ void MainWindow::handleOperationStatus(bool success, const QString& message) {
                 // После импорта нужно обновить список книг
             onRefreshBooksClicked();
             return; // Завершаем обработку здесь
+        } else if (message.startsWith("block_user+")) {
+            userVisibleMessage = "Пользователь успешно заблокирован.";
+            needsUserListUpdate = true; // Устанавливаем флаг
+        } else if (message.startsWith("unblock_user+")) {
+            userVisibleMessage = "Пользователь успешно разблокирован.";
+            needsUserListUpdate = true; // Устанавливаем флаг
+        }
+         else if (message.startsWith("reset_password+")) {
+            userVisibleMessage = "Пароль успешно установлен."; // Изменили сообщение
+            QMessageBox::information(this, "Успех", userVisibleMessage);
+            // Не возвращаемся никуда, остаемся на экране библиотекаря
+            return;
+        } else if (message.startsWith("update_email+")) {
+            userVisibleMessage = "Email пользователя успешно обновлен.";
+            onRefreshUsersClicked(); // Обновляем список, чтобы увидеть изменения если бы они там были
         }
         // --- Другие успешные операции ---
         else if (message.startsWith("extend_rental+")) {
@@ -506,13 +535,19 @@ void MainWindow::handleOperationStatus(bool success, const QString& message) {
             userVisibleMessage = "Книга успешно выдана пользователю.";
             needsLibrarianBooksUpdate = true;
             needsLibrarianDebtsUpdate = true;
+            // Обновляем статистику
+            if (mStackedWidget->currentWidget() == mLibrarianScreen) onRefreshStatsClicked();
         } else if (message.startsWith("unassign_book+")) {
             userVisibleMessage = "Книга успешно возвращена.";
             needsLibrarianBooksUpdate = true;
             needsLibrarianDebtsUpdate = true;
+            // Обновляем статистику
+            if (mStackedWidget->currentWidget() == mLibrarianScreen) onRefreshStatsClicked();
         } else if (message.startsWith("add_book_lib+")) {
             userVisibleMessage = "Книга успешно добавлена в библиотеку.";
             needsLibrarianBooksUpdate = true;
+            // Обновляем статистику
+            if (mStackedWidget->currentWidget() == mLibrarianScreen) onRefreshStatsClicked();
         } else if (message.startsWith("update_book+")) {
             userVisibleMessage = "Информация о книге успешно обновлена.";
             needsLibrarianBooksUpdate = true;
@@ -535,6 +570,9 @@ void MainWindow::handleOperationStatus(bool success, const QString& message) {
             }
             if (needsClientBookStatsUpdate && mStackedWidget->currentWidget() == mClientScreen) {
                 Client::get_instance().viewBookStats();
+            }
+            if (needsUserListUpdate && mStackedWidget->currentWidget() == mLibrarianScreen) {
+                onRefreshUsersClicked();
             }
         }
 
@@ -577,7 +615,25 @@ void MainWindow::handleOperationStatus(bool success, const QString& message) {
             else userVisibleMessage = "Не удалось загрузить аннотацию: " + userVisibleMessage; // Общая ошибка
             // ПРИ ОШИБКЕ ЗАГРУЗКИ ВОЗВРАЩАЕМ НАЗАД!
             onBackToLibrarianClicked(); // Не можем редактировать, если не загрузили
+        } else if (message.startsWith("block_user-")) {
+            userVisibleMessage = "Не удалось заблокировать пользователя (возможно, не найден).";
+        } else if (message.startsWith("unblock_user-")) {
+            userVisibleMessage = "Не удалось разблокировать пользователя (возможно, не найден).";
+        } else if (message.startsWith("reset_password-")) {
+            userVisibleMessage = message.mid(17).trimmed(); // Убираем префикс
+            // Обработка специфичных ошибок с сервера (если есть)
+            if(userVisibleMessage == "New password does not meet requirements (8-12 chars, lat/num/symbols)") {
+                userVisibleMessage = "Ошибка: Новый пароль не соответствует требованиям (8-12 симв., лат./цифры/символы).";
+            } else if(userVisibleMessage == "Failed to set new password (user not found? DB error?)") {
+                userVisibleMessage = "Не удалось установить пароль (пользователь не найден или ошибка БД).";
+            } else {
+                userVisibleMessage = "Не удалось установить пароль: " + userVisibleMessage;
+            }
         }
+        else if (message.startsWith("update_email-")) {
+            userVisibleMessage = "Не удалось обновить email (возможно, email уже занят или пользователь не найден).";
+        }
+
         else if (message == "Disconnected from server") { // НЕОЖИДАННЫЙ дисконнект
             qDebug() << "Unexpected disconnection detected by handleOperationStatus.";
             // ★ Показываем сообщение, НО НЕ вызываем onBackButtonClicked рекурсивно ★
@@ -843,6 +899,34 @@ void MainWindow::setupClientScreen() {
     allBooksLayout->addWidget(mClientAllBooksTable, 1); // Растягиваем таблицу по вертикали
     mainClientLayout->addWidget(allBooksGroup, 1); // Растягиваем группу каталога
 
+    // ИСТОРИЯ АРЕНДЫ
+    mClientHistoryGroup = new QGroupBox("История моих аренд");
+    QVBoxLayout* historyLayout = new QVBoxLayout(mClientHistoryGroup);
+
+    mClientViewHistoryButton = new QPushButton("Показать/Обновить историю", this);
+    QHBoxLayout* historyButtonLayout = new QHBoxLayout(); // Чтобы кнопка не была широкой
+    historyButtonLayout->addStretch();
+    historyButtonLayout->addWidget(mClientViewHistoryButton);
+    historyButtonLayout->addStretch();
+    historyLayout->addLayout(historyButtonLayout);
+
+    mClientHistoryTable = new QTableWidget(this);
+    mClientHistoryTable->setColumnCount(5); // Title, Start, Scheduled End, Returned, (ID опционально)
+    mClientHistoryTable->setHorizontalHeaderLabels({ "Название книги", "Дата выдачи", "План. возврат", "Факт. возврат", "ID Аренды"}); // Поменял порядок
+    mClientHistoryTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); // Сначала растянем все
+    mClientHistoryTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents); // Сузим название
+    mClientHistoryTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents); // Сузим ID
+    mClientHistoryTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    mClientHistoryTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    mClientHistoryTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    mClientHistoryTable->setAlternatingRowColors(true);
+    mClientHistoryTable->verticalHeader()->setVisible(false);
+    mClientHistoryTable->setMinimumHeight(120); // Дадим немного места
+    historyLayout->addWidget(mClientHistoryTable, 1); // Растягиваем таблицу истории
+
+    mainClientLayout->addWidget(mClientHistoryGroup); // Добавляем группу истории
+
+
     // Кнопка "Назад" / Выход
     mClientBackButton = new QPushButton("Выйти", this);
     QHBoxLayout* backLayout = new QHBoxLayout();
@@ -860,6 +944,9 @@ void MainWindow::setupClientScreen() {
     connect(mClientViewAllBooksButton, &QPushButton::clicked, this, &MainWindow::onClientViewAllBooksClicked);
     connect(mClientBackButton, &QPushButton::clicked, this, &MainWindow::onBackButtonClicked);
     connect(mClientAllBooksTable, &QTableWidget::itemDoubleClicked, this, &MainWindow::onClientBookDoubleClicked);
+    // Connect для кнопки истории
+    connect(mClientViewHistoryButton, &QPushButton::clicked, this, &MainWindow::onClientViewHistoryClicked);
+
 }
 
 void MainWindow::setupLibrarianScreen() {
@@ -949,6 +1036,32 @@ void MainWindow::setupLibrarianScreen() {
     QVBoxLayout* rightColumnLayout = new QVBoxLayout();
     columnsLayout->addLayout(rightColumnLayout, 1); // Правая колонка (тоже растягивается)
 
+
+    // Секция Статистики (вверху правой колонки)
+    mStatsGroup = new QGroupBox("Статистика Библиотеки");
+    QGridLayout* statsLayout = new QGridLayout(mStatsGroup);
+
+    statsLayout->addWidget(new QLabel("Всего книг:"), 0, 0);
+    mTotalBooksLabel = new QLabel("..."); statsLayout->addWidget(mTotalBooksLabel, 0, 1);
+    statsLayout->addWidget(new QLabel("Доступно книг:"), 1, 0);
+    mAvailableBooksLabel = new QLabel("..."); statsLayout->addWidget(mAvailableBooksLabel, 1, 1);
+    statsLayout->addWidget(new QLabel("Книг на руках:"), 2, 0);
+    mRentedBooksLabel = new QLabel("..."); statsLayout->addWidget(mRentedBooksLabel, 2, 1);
+    statsLayout->addWidget(new QLabel("Зарег. клиентов:"), 3, 0);
+    mTotalClientsLabel = new QLabel("..."); statsLayout->addWidget(mTotalClientsLabel, 3, 1);
+    statsLayout->addWidget(new QLabel("Активных аренд:"), 4, 0);
+    mActiveRentalsLabel = new QLabel("..."); statsLayout->addWidget(mActiveRentalsLabel, 4, 1);
+    statsLayout->addWidget(new QLabel("Просроченных аренд:"), 5, 0);
+    mOverdueRentalsLabel = new QLabel("..."); statsLayout->addWidget(mOverdueRentalsLabel, 5, 1);
+
+    mRefreshStatsButton = new QPushButton("Обновить статистику", this);
+    statsLayout->addWidget(mRefreshStatsButton, 6, 0, 1, 2, Qt::AlignCenter); // Кнопка под статистикой по центру
+
+    statsLayout->setColumnStretch(1, 1); // Растянуть колонку со значениями
+
+    rightColumnLayout->addWidget(mStatsGroup); // Добавляем статистику в ПРАВУЮ колонку
+
+
     QGroupBox *userManageGroup = new QGroupBox("Управление пользователями и выдачей");
     QVBoxLayout* userManageLayout = new QVBoxLayout(userManageGroup);
         // Поля User ID и Login
@@ -980,6 +1093,23 @@ void MainWindow::setupLibrarianScreen() {
     QGroupBox *usersListGroup = new QGroupBox("Пользователи системы");
     QVBoxLayout *usersListLayout = new QVBoxLayout(usersListGroup);
 
+    // --- Кнопки действий над ВЫБРАННЫМ пользователем из списка ---
+    // Добавим их ПОД списком пользователей
+    QGroupBox* userActionsGroup = new QGroupBox("Действия над выбранным пользователем");
+    QHBoxLayout* userActionsLayout = new QHBoxLayout(userActionsGroup);
+
+    mBlockUserButton = new QPushButton("Заблокировать", this);
+    mUnblockUserButton = new QPushButton("Разблокировать", this);
+    mResetPasswordButton = new QPushButton("Сбросить пароль", this);
+    mChangeEmailButton = new QPushButton("Сменить Email", this);
+
+    userActionsLayout->addWidget(mBlockUserButton);
+    userActionsLayout->addWidget(mUnblockUserButton);
+    userActionsLayout->addWidget(mResetPasswordButton);
+    userActionsLayout->addWidget(mChangeEmailButton);
+    userActionsLayout->addStretch();
+
+
     // Кнопка обновления списка пользователей
     mRefreshUsersButton = new QPushButton("Обновить список пользователей", this);
     QHBoxLayout *refreshUsersLayout = new QHBoxLayout(); // Чтобы кнопка не растягивалась
@@ -990,10 +1120,14 @@ void MainWindow::setupLibrarianScreen() {
 
     // Таблица пользователей
     mLibrarianUsersTable = new QTableWidget(this);
-    mLibrarianUsersTable->setColumnCount(2); // ID, Login
-    mLibrarianUsersTable->setHorizontalHeaderLabels({"User ID", "Логин"});
+    mLibrarianUsersTable->setColumnCount(3); // КОЛИЧЕСТВО КОЛОНОК = 3
+    // ОБНОВЛЕНЫ ЗАГОЛОВКИ
+    mLibrarianUsersTable->setHorizontalHeaderLabels({"User ID", "Логин", "Статус"});
     mLibrarianUsersTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents); // Авторазмер ID
-    mLibrarianUsersTable->horizontalHeader()->setStretchLastSection(true); // Растянуть Login
+    mLibrarianUsersTable->horizontalHeader()->setStretchLastSection(false); // НЕ РАСТЯГИВАТЬ ПОСЛЕДНЮЮ (СТАТУС)
+    mLibrarianUsersTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch); // РАСТЯНУТЬ ЛОГИН
+    mLibrarianUsersTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents); // Авторазмер Статус
+
     mLibrarianUsersTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     mLibrarianUsersTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     mLibrarianUsersTable->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -1002,6 +1136,7 @@ void MainWindow::setupLibrarianScreen() {
     mLibrarianUsersTable->setMinimumHeight(150); // Ограничить минимальную высоту
     usersListLayout->addWidget(mLibrarianUsersTable, 1); // Растягиваем таблицу
     rightColumnLayout->addWidget(usersListGroup); // Добавляем группу в правую колонку
+    rightColumnLayout->addWidget(userActionsGroup); // Блок с кнопками действий
 
     // Группа отображения долгов/выдачи
     QGroupBox *debtsGroup = new QGroupBox("Информация о выдаче/долгах");
@@ -1025,7 +1160,7 @@ void MainWindow::setupLibrarianScreen() {
     mLibrarianDebtsTable->setAlternatingRowColors(true);
     mLibrarianDebtsTable->verticalHeader()->setVisible(false);
     debtsLayout->addWidget(mLibrarianDebtsTable, 1); // Растягиваем таблицу
-    rightColumnLayout->addWidget(debtsGroup, 1); // Добавляем группу долгов, растягиваем
+    rightColumnLayout->addWidget(debtsGroup, 1); // Блок с долгами
 
     // --- Кнопка Назад/Выход (внизу всего окна) ---
     mLibrarianBackButton = new QPushButton("Выйти", this);
@@ -1056,6 +1191,15 @@ void MainWindow::setupLibrarianScreen() {
 
     connect(mImportBooksButton, &QPushButton::clicked, this, &MainWindow::onImportBooksClicked);
     connect(mExportBooksButton, &QPushButton::clicked, this, &MainWindow::onExportBooksClicked);
+
+    // Connect для новых кнопок управления пользователями
+    connect(mBlockUserButton, &QPushButton::clicked, this, &MainWindow::onBlockUserClicked);
+    connect(mUnblockUserButton, &QPushButton::clicked, this, &MainWindow::onUnblockUserClicked);
+    connect(mResetPasswordButton, &QPushButton::clicked, this, &MainWindow::onResetPasswordClicked);
+    connect(mChangeEmailButton, &QPushButton::clicked, this, &MainWindow::onChangeEmailClicked);
+
+    // Connect для кнопки обновления статистики
+    connect(mRefreshStatsButton, &QPushButton::clicked, this, &MainWindow::onRefreshStatsClicked);
 }
 
 
@@ -1359,7 +1503,7 @@ void MainWindow::handleAllUsersList(const QStringList& users) {
     populateUsersTable(users);
 }
 
-// Метод для заполнения таблицы пользователей
+// Метод для заполнения таблицы пользователей С УЧЕТОМ СТАТУСА
 void MainWindow::populateUsersTable(const QStringList& users) {
     if (!mLibrarianUsersTable) return;
 
@@ -1369,31 +1513,45 @@ void MainWindow::populateUsersTable(const QStringList& users) {
 
     for (const QString &userData : users) {
         QStringList parts = userData.split(',');
-        if (parts.size() < 2) continue; // Ожидаем ID, Login
+        if (parts.size() < 3) continue; // Ожидаем ID, Login, Status
 
         int row = mLibrarianUsersTable->rowCount();
         mLibrarianUsersTable->insertRow(row);
 
         // Создаем QTableWidgetItem для ID и Login
-        QTableWidgetItem* idItem = new QTableWidgetItem(parts.value(0)); // ID
-        QTableWidgetItem* loginItem = new QTableWidgetItem(parts.value(1)); // Login
+        QTableWidgetItem* idItem = new QTableWidgetItem(parts.value(0));
+        QTableWidgetItem* loginItem = new QTableWidgetItem(parts.value(1));
 
-        // Опционально: Выравнивание ID по центру/правому краю
-        //idItem->setTextAlignment(Qt::AlignCenter);
+        // Создаем и настраиваем Item для Статуса
+        QString statusText = parts.value(2);
+        QTableWidgetItem* statusItem = new QTableWidgetItem();
+        statusItem->setTextAlignment(Qt::AlignCenter); // Выравниваем по центру
+
+        if (statusText == "active") {
+            statusItem->setText("Активен");
+            statusItem->setForeground(QColorConstants::DarkGreen);
+        } else if (statusText == "blocked") {
+            statusItem->setText("Заблок.");
+            statusItem->setForeground(QColorConstants::Red);
+        } else {
+            statusItem->setText(statusText); // Показать как есть, если статус не известен
+            statusItem->setForeground(QColorConstants::Gray); // Серым цветом
+        }
 
         // Добавляем в таблицу
         mLibrarianUsersTable->setItem(row, 0, idItem);
         mLibrarianUsersTable->setItem(row, 1, loginItem);
+        mLibrarianUsersTable->setItem(row, 2, statusItem); // Добавляем статус
 
         // Запрет редактирования
-        for (int col = 0; col < 2; ++col) {
+        for (int col = 0; col < 3; ++col) { // Цикл до 3 колонок
             if (QTableWidgetItem* item = mLibrarianUsersTable->item(row, col)) {
                 item->setFlags(item->flags() & ~Qt::ItemIsEditable);
             }
         }
     }
     mLibrarianUsersTable->resizeColumnsToContents(); // Авторазмер колонок
-    mLibrarianUsersTable->horizontalHeader()->setStretchLastSection(true); // Растянуть колонку Login
+    mLibrarianUsersTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch); // Растянуть колонку Login снова
     mLibrarianUsersTable->setSortingEnabled(true);
 }
 
@@ -1476,4 +1634,199 @@ void MainWindow::handleExportCsvData(const QString& csvData) {
     } else {
         QMessageBox::information(this, "Экспорт завершен", "Каталог книг успешно сохранен в файл:\n" + filePath);
     }
+}
+
+// Вспомогательная функция для получения ID выбранного пользователя
+int MainWindow::getSelectedUserIdFromTable(QTableWidget* table) {
+    if (!table) return -1;
+    QList<QTableWidgetItem*> selectedItems = table->selectedItems();
+    if (selectedItems.isEmpty()) {
+        QMessageBox::warning(this, "Ошибка", "Пожалуйста, выберите пользователя из списка.");
+        return -1; // Ничего не выбрано
+    }
+    // Предполагаем, что ID в первой колонке (индекс 0)
+    int selectedRow = selectedItems.first()->row();
+    QTableWidgetItem* idItem = table->item(selectedRow, 0);
+    if (!idItem) {
+        QMessageBox::critical(this, "Ошибка", "Не удалось получить ID пользователя из таблицы.");
+        return -1;
+    }
+    bool ok;
+    int userId = idItem->text().toInt(&ok);
+    if (!ok || userId <= 0) {
+        QMessageBox::warning(this, "Ошибка", "Неверный ID пользователя в таблице.");
+        return -1;
+    }
+    return userId;
+}
+
+
+// Слоты для новых кнопок управления пользователями
+
+void MainWindow::onBlockUserClicked() {
+    int userId = getSelectedUserIdFromTable(mLibrarianUsersTable);
+    if (userId > 0) {
+        // Опционально: спросить подтверждение
+        QMessageBox::StandardButton reply;
+        reply = QMessageBox::question(this, "Блокировка", QString("Вы уверены, что хотите заблокировать пользователя ID %1?").arg(userId),
+                                      QMessageBox::Yes|QMessageBox::No);
+        if (reply == QMessageBox::Yes) {
+            Client::get_instance().blockUser(userId);
+        }
+    }
+}
+
+void MainWindow::onUnblockUserClicked() {
+    int userId = getSelectedUserIdFromTable(mLibrarianUsersTable);
+    if (userId > 0) {
+        Client::get_instance().unblockUser(userId);
+        // Обновление статуса не отображается в таблице пользователей,
+        // но можно было бы добавить колонку "Status" и обновлять ее здесь или в handleOperationStatus.
+    }
+}
+
+// ★ Слот для кнопки "Сбросить/Задать пароль" ★
+void MainWindow::onResetPasswordClicked() {
+    int userId = getSelectedUserIdFromTable(mLibrarianUsersTable);
+    if (userId <= 0) return; // getSelectedUserIdFromTable уже покажет ошибку
+
+    bool ok1, ok2;
+    // Запрашиваем НОВЫЙ пароль у библиотекаря
+    QString newPassword = QInputDialog::getText(this, tr("Установка Нового Пароля"),
+                                                tr("Введите НОВЫЙ пароль для пользователя ID %1:").arg(userId),
+                                                QLineEdit::Password, // Скрыть ввод
+                                                "", &ok1);
+
+    if (!ok1 || newPassword.isEmpty()) {
+        if (ok1) QMessageBox::warning(this, "Ошибка", "Пароль не может быть пустым.");
+        return; // Пользователь отменил или ввел пустую строку
+    }
+
+    // Запрашиваем подтверждение пароля
+    QString confirmPassword = QInputDialog::getText(this, tr("Подтверждение Пароля"),
+                                                    tr("Повторите НОВЫЙ пароль для пользователя ID %1:").arg(userId),
+                                                    QLineEdit::Password, // Скрыть ввод
+                                                    "", &ok2);
+
+    if (!ok2) {
+        return; // Пользователь отменил на втором шаге
+    }
+
+    if (newPassword != confirmPassword) {
+        QMessageBox::critical(this, "Ошибка", "Введенные пароли не совпадают!");
+        return;
+    }
+
+    // Клиентская валидация пароля (можно продублировать серверную для UX)
+    if (newPassword.length() < 8 || newPassword.length() > 12 || !QRegularExpression("^[a-zA-Z0-9!@#$%^&*()_+-=]+$").match(newPassword).hasMatch()) {
+        QMessageBox::warning(this, "Ошибка", "Новый пароль не соответствует требованиям:\n8-12 символов (лат. буквы, цифры, !@#$%^&*()_+-=)."); return;
+    }
+
+    // Спрашиваем окончательное подтверждение
+    QMessageBox::StandardButton reply;
+    reply = QMessageBox::question(this, "Подтверждение",
+                                  QString("Установить новый пароль для пользователя ID %1?").arg(userId),
+                                  QMessageBox::Yes|QMessageBox::No);
+    if (reply == QMessageBox::Yes) {
+        // Отправляем новый пароль (не хешированный!) на сервер
+        Client::get_instance().resetUserPassword(userId, newPassword);
+        // Ответ сервера будет обработан в handleOperationStatus
+    }
+}
+void MainWindow::onChangeEmailClicked() {
+    int userId = getSelectedUserIdFromTable(mLibrarianUsersTable);
+    if (userId <= 0) return;
+
+    bool ok;
+    // Используем QInputDialog для получения нового email
+    QString newEmail = QInputDialog::getText(this, tr("Смена Email"),
+                                             tr("Введите новый email для пользователя ID %1:").arg(userId),
+                                             QLineEdit::Normal, // Обычное поле ввода
+                                             "", &ok); // "" - начальное значение
+
+    if (ok && !newEmail.isEmpty()) {
+        // Простая клиентская валидация (серверная более строгая)
+        static const QRegularExpression emailRegex("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+        if (!emailRegex.match(newEmail).hasMatch()) {
+            QMessageBox::warning(this, "Ошибка", "Неверный формат email.");
+            return;
+        }
+        // Отправка запроса
+        Client::get_instance().updateUserEmail(userId, newEmail);
+    } else if (ok && newEmail.isEmpty()) {
+        QMessageBox::warning(this, "Ошибка", "Email не может быть пустым.");
+    }
+}
+
+// Слот для кнопки "Показать историю аренды" клиента
+void MainWindow::onClientViewHistoryClicked() {
+    Client::get_instance().viewRentalHistory();
+}
+
+// Слот для обработки сигнала с историей аренды
+void MainWindow::handleRentalHistory(const QStringList& history) {
+    qDebug() << "Received rental history for display:" << history;
+    populateHistoryTable(history);
+}
+
+// Метод для заполнения таблицы истории аренды клиента
+void MainWindow::populateHistoryTable(const QStringList& history) {
+    if (!mClientHistoryTable) return;
+
+    mClientHistoryTable->setRowCount(0);
+    mClientHistoryTable->clearSelection();
+    mClientHistoryTable->setSortingEnabled(false);
+
+    for (const QString &historyEntry : history) {
+        QStringList parts = historyEntry.split(',');
+        // Ожидаем "history_id,title,start_date,scheduled_end_date,actual_return_date"
+        if (parts.size() < 5) continue;
+
+        int row = mClientHistoryTable->rowCount();
+        mClientHistoryTable->insertRow(row);
+
+        // Заполняем колонки: Title, Start, Scheduled End, Returned, ID
+        mClientHistoryTable->setItem(row, 0, new QTableWidgetItem(parts.value(1))); // Title
+        mClientHistoryTable->setItem(row, 1, new QTableWidgetItem(parts.value(2))); // Start Date
+        mClientHistoryTable->setItem(row, 2, new QTableWidgetItem(parts.value(3))); // Scheduled End Date
+        mClientHistoryTable->setItem(row, 3, new QTableWidgetItem(parts.value(4))); // Actual Return Date
+        mClientHistoryTable->setItem(row, 4, new QTableWidgetItem(parts.value(0))); // History ID (опционально)
+
+        // Запрет редактирования
+        for (int col = 0; col < 5; ++col) {
+            if (QTableWidgetItem* item = mClientHistoryTable->item(row, col)) {
+                item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+            }
+        }
+    }
+    mClientHistoryTable->resizeColumnsToContents();
+    mClientHistoryTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch); // Растянуть название
+    mClientHistoryTable->setSortingEnabled(true); // Включаем сортировку
+    mClientHistoryTable->sortByColumn(3, Qt::DescendingOrder); // Сортируем по дате возврата (новейшие сверху)
+}
+
+// Слот для кнопки "Обновить статистику"
+void MainWindow::onRefreshStatsClicked() {
+    // Очищаем старые значения на время загрузки
+    mTotalBooksLabel->setText("...");
+    mAvailableBooksLabel->setText("...");
+    mRentedBooksLabel->setText("...");
+    mTotalClientsLabel->setText("...");
+    mActiveRentalsLabel->setText("...");
+    mOverdueRentalsLabel->setText("...");
+    // Запрашиваем новые данные
+    Client::get_instance().getLibraryStats();
+}
+
+// Слот для обработки полученной статистики
+void MainWindow::handleLibraryStats(int totalBooks, int availableBooks, int rentedBooks,
+                                    int totalClients, int activeRentals, int overdueRentals)
+{
+    qDebug() << "Updating stats display:" << totalBooks << availableBooks << rentedBooks << totalClients << activeRentals << overdueRentals;
+    mTotalBooksLabel->setText(QString::number(totalBooks));
+    mAvailableBooksLabel->setText(QString::number(availableBooks));
+    mRentedBooksLabel->setText(QString::number(rentedBooks));
+    mTotalClientsLabel->setText(QString::number(totalClients));
+    mActiveRentalsLabel->setText(QString::number(activeRentals));
+    mOverdueRentalsLabel->setText(QString::number(overdueRentals));
 }
