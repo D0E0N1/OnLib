@@ -44,6 +44,18 @@ private:
 
     QString handleImportBooksCsv(const QStringList& parts);
     QString handleExportBooksCsv(const QStringList& parts);
+
+    // Новые обработчики для управления пользователями
+    QString handleBlockUser(const QStringList& parts);
+    QString handleUnblockUser(const QStringList& parts);
+    QString handleResetUserPassword(const QStringList& parts);
+    QString handleUpdateUserEmail(const QStringList& parts);
+
+    // Новый обработчик для истории аренды
+    QString handleGetRentalHistory(const QStringList& parts);
+
+    // Новый обработчик для статистики
+    QString handleGetLibraryStats(const QStringList& parts);
 };
 
 #endif // COMMANDHANDLER_H

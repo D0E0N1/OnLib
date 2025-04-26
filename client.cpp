@@ -207,7 +207,15 @@ void Client::onReadyRead() {
             qWarning() << "Received empty export_books+ response.";
             emit operationStatusReceived(false, "Сервер прислал пустые данные для экспорта.");
         }
+    } else if (command == "rental_history+") {
+        QStringList historyList;
+        if (parts.size() >= 2 && !parts[1].isEmpty()) {
+            historyList = parts[1].split('|');
+        }
+        qDebug() << "[Client] Emitting rentalHistoryReceived with entries:" << historyList;
+        emit rentalHistoryReceived(historyList);
     }
+
     // Обработка УСПЕХА обновления аннотации (статус придет через operationStatusReceived)
     else if (command == "update_annotation+") {
         if (parts.size() == 2) { // update_annotation+ & book_id
@@ -251,7 +259,33 @@ void Client::onReadyRead() {
         // Отправляем сигнал со списком строк "id,title,start,end"
         qDebug() << "[Client] Emitting bookStatsReceived with entries:" << bookEntriesList;
         emit bookStatsReceived(bookEntriesList); // <-- ПЕРЕДАЕМ ПРАВИЛЬНЫЙ СПИСОК
+    } // Обработка ответа со статистикой
+    else if (command == "library_stats+") {
+        if (parts.size() == 7) { // Ожидаем 6 значений + команда
+            bool ok[6];
+            int totalBooks = parts[1].toInt(&ok[0]);
+            int availableBooks = parts[2].toInt(&ok[1]);
+            int rentedBooks = parts[3].toInt(&ok[2]);
+            int totalClients = parts[4].toInt(&ok[3]);
+            int activeRentals = parts[5].toInt(&ok[4]);
+            int overdueRentals = parts[6].toInt(&ok[5]);
+
+            // Проверяем, что все преобразования прошли успешно
+            bool allOk = true;
+            for(int i=0; i<6; ++i) { if(!ok[i]) allOk = false; }
+
+            if (allOk) {
+                emit libraryStatsReceived(totalBooks, availableBooks, rentedBooks, totalClients, activeRentals, overdueRentals);
+            } else {
+                qWarning() << "Failed to parse integer from library_stats+ response:" << responseStr;
+                emit operationStatusReceived(false, "Сервер прислал неверный формат статистики.");
+            }
+        } else {
+            qWarning() << "Invalid format for library_stats+ response (expected 7 parts):" << responseStr;
+            emit operationStatusReceived(false, "Сервер прислал неверный формат статистики.");
+        }
     }
+
     else if (command == "user_info+") {
         if (parts.size() >= 2) {
             QStringList info = parts[1].split(',');
@@ -359,3 +393,49 @@ void Client::importBooksCsv(const QString& csvData) {
 void Client::exportBooksCsv() {
     sendRequest("export_books_csv");
 }
+
+// Реализации новых методов для управления пользователями
+void Client::blockUser(int user_id) {
+    sendRequest(QString("block_user&%1").arg(user_id));
+}
+
+void Client::unblockUser(int user_id) {
+    sendRequest(QString("unblock_user&%1").arg(user_id));
+}
+
+// ★ Метод теперь принимает и отправляет новый пароль ★
+void Client::resetUserPassword(int user_id, const QString& new_password) {
+    // Проверка на '&' (лучше бы использовать Base64)
+    if (new_password.contains('&')) {
+        qWarning() << "New password contains '&', this might break the protocol!";
+        emit operationStatusReceived(false, "Пароль содержит недопустимый символ '&'");
+        return;
+    }
+    sendRequest(QString("reset_user_password&%1&%2").arg(user_id).arg(new_password));
+}
+
+void Client::updateUserEmail(int user_id, const QString& new_email) {
+    // Простая проверка на клиенте (более строгая на сервере)
+    if (new_email.contains('&') || new_email.contains('\r') || new_email.contains('\n')) {
+        qWarning() << "Email contains forbidden characters for current protocol.";
+        emit operationStatusReceived(false, "Email содержит недопустимые символы.");
+        return;
+    }
+    sendRequest(QString("update_user_email&%1&%2").arg(user_id).arg(new_email));
+}
+
+// Запрос истории аренды текущего пользователя
+void Client::viewRentalHistory() {
+    if (mUserId <= 0) {
+        qWarning() << "Cannot view rental history: User not logged in.";
+        emit operationStatusReceived(false, "Для просмотра истории необходимо войти.");
+        return;
+    }
+    sendRequest(QString("get_rental_history&%1").arg(mUserId));
+}
+
+// Запрос статистики библиотеки
+void Client::getLibraryStats() {
+    sendRequest("get_library_stats");
+}
+
