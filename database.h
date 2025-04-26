@@ -76,6 +76,22 @@ public:
     // Новые методы для аннотаций
     QString getBookAnnotation(int book_id); // Получить аннотацию И название
     bool updateBookAnnotation(int book_id, const QString& annotation);
+
+    // Новые методы для управления пользователями
+    bool setUserStatus(int user_id, const QString& status); // 'active' or 'blocked'
+    bool resetUserPassword(int user_id, const QString& new_password);
+    bool updateUserEmail(int user_id, const QString& new_email);
+    QString getUserStatus(int user_id); // Добавлен метод получения статуса
+
+    // Новый метод для получения ИСТОРИИ аренды пользователя
+    QStringList getUserRentalHistory(int user_id);
+
+    // ★ Новые методы для статистики ★
+    int getTotalBookCount();
+    int getAvailableBookCount();
+    int getTotalClientCount();
+    int getActiveRentalCount();
+    int getOverdueRentalCount();
 };
 
 #endif // DATABASE_H
