@@ -92,6 +92,20 @@ public:
     int getTotalClientCount();
     int getActiveRentalCount();
     int getOverdueRentalCount();
+
+    // Новые методы для ДЕТАЛЬНЫХ ОТЧЕТОВ
+
+    // Метод для получения списка уникальных жанров (для фильтра)
+    QStringList getGenres();
+
+    // Основной метод для генерации данных отчета
+    // Принимает тип отчета, даты периода и опциональный фильтр
+    // Возвращает строку с данными:
+    //   - для таблицы: "Заг1,Заг2|Данные11,Данные12|Данные21,Данные22..."
+    //   - для графика: "chart:ТипОтчета&Метка1,Метка2&Значение1,Значение2..."
+    //   - ошибка: "error:Сообщение об ошибке"
+    //   - нет данных: "" (пустая строка)
+    QString getReportData(const QString& reportType, const QString& startDate, const QString& endDate, const QString& optionalFilter = "");
 };
 
 #endif // DATABASE_H

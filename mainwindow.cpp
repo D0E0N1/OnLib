@@ -23,6 +23,16 @@
 #include <QInputDialog>   // Для запроса email
 #include <QRegularExpressionValidator> // Для валидации email в диалоге
 
+#include <QDate>
+#include <QtCharts/QChartView>
+#include <QtCharts/QPieSeries>
+#include <QtCharts/QPieSlice>     // Добавлен для доступа к срезам
+#include <QtCharts/QBarSeries>
+#include <QtCharts/QBarSet>
+#include <QtCharts/QLegend>
+#include <QtCharts/QBarCategoryAxis>
+#include <QtCharts/QValueAxis>
+
 extern void applyTheme(bool useDark); // Объявляем внешнюю функцию
 
 MainWindow::MainWindow(QWidget *parent)
@@ -38,6 +48,7 @@ MainWindow::MainWindow(QWidget *parent)
     setupClientScreen();
     setupLibrarianScreen();
     setupAnnotationScreen();
+    setupStatsScreen();
     setupMenus(); // Вызов настройки меню
 
     // 3. Попытка подключения к серверу при запуске
@@ -96,6 +107,11 @@ MainWindow::MainWindow(QWidget *parent)
     // Connect для статистики
     connect(&Client::get_instance(), &Client::libraryStatsReceived,
             this, &MainWindow::handleLibraryStats);
+    // Новые connect'ы для обработки ответов на запросы отчетов
+    connect(&Client::get_instance(), &Client::statisticsReportReceived,
+            this, &MainWindow::handleStatisticsReportReceived);
+    connect(&Client::get_instance(), &Client::chartDataReceived,
+            this, &MainWindow::handleChartDataReceived);
 
     // 8. Установка начального экрана
     mStackedWidget->setCurrentWidget(mMainScreen);
@@ -125,6 +141,9 @@ void MainWindow::setupMenus() {
 
     // Соединяем сигнал изменения состояния с нашим слотом
     connect(mThemeAction, &QAction::triggered, this, &MainWindow::onThemeChangeToggled);
+    // Для получения списка жанров
+    connect(&Client::get_instance(), &Client::genresListReceived,
+            this, &MainWindow::handleGenresList);
 
     mViewMenu->addAction(mThemeAction);
 }
@@ -143,6 +162,35 @@ void MainWindow::onThemeChangeToggled(bool checked) {
 // =============================================
 // Navigation Handlers
 // =============================================
+
+// Слот для перехода на экран статистики (вызывается кнопкой "Отчетность")
+void MainWindow::onShowStatsScreenClicked() {
+    // Очистка предыдущего отчета перед переходом
+    mReportTableWidget->setRowCount(0);
+    mReportTableWidget->clearContents();
+
+
+    mReportDisplayWidget->setCurrentWidget(mReportTableWidget); // Показываем таблицу по умолчанию
+    mExportReportButton->setEnabled(false); // Блокируем экспорт, т.к. данных нет
+
+    qDebug() << "Requesting genres list from onShowStatsScreenClicked...";
+    Client::get_instance().requestGenresList();
+    // Переключаем основной stackedWidget на экран статистики
+    mStackedWidget->setCurrentWidget(mStatsScreen);
+
+    // TODO: Здесь можно добавить логику для однократного запроса и заполнения
+    //       фильтра жанров (mGenreFilterCombo), если он еще не заполнен.
+    // Пример:
+    // if (mGenreFilterCombo->count() <= 1) { // <=1, т.к. "Все жанры" мы добавили вручную
+    //     Client::get_instance().requestGenres(); // Нужен новый метод в Client и обработчик
+    // }
+}
+
+// Слот для возврата с экрана статистики на экран библиотекаря
+void MainWindow::onBackFromStatsClicked() {
+    mStackedWidget->setCurrentWidget(mLibrarianScreen);
+}
+
 void MainWindow::onRegButtonClicked() {
     mStackedWidget->setCurrentWidget(mRegScreen);
 }
@@ -190,6 +238,479 @@ void MainWindow::onBackButtonClicked() {
     // Очистка лога сервера и переход на главный экран
     mResponseTextEdit->clear();
     mStackedWidget->setCurrentWidget(mMainScreen);
+}
+
+// =============================================
+// Statistics Screen Setup and Handlers
+// =============================================
+
+// Метод настройки пользовательского интерфейса экрана статистики
+void MainWindow::setupStatsScreen() {
+    mStatsScreen = new QWidget();
+    QVBoxLayout *mainLayout = new QVBoxLayout(mStatsScreen);
+
+    // --- Группа виджетов для фильтров ---
+    QGroupBox *filterGroup = new QGroupBox("Параметры отчета");
+    QGridLayout *filterLayout = new QGridLayout(filterGroup);
+
+    // Виджет для выбора начальной даты
+    mStartDateEdit = new QDateEdit(QDate::currentDate().addMonths(-1)); // По умолчанию - месяц назад
+    mStartDateEdit->setCalendarPopup(true); // Выпадающий календарь
+    mStartDateEdit->setDisplayFormat("yyyy-MM-dd"); // Установка формата даты
+
+    // Виджет для выбора конечной даты
+    mEndDateEdit = new QDateEdit(QDate::currentDate()); // По умолчанию - сегодня
+    mEndDateEdit->setCalendarPopup(true);
+    mEndDateEdit->setDisplayFormat("yyyy-MM-dd");
+
+    // Выпадающий список для выбора типа отчета
+    mReportTypeCombo = new QComboBox();
+    mReportTypeCombo->addItem("Активность (Выдачи/Возвраты)", "activity_io"); // Пример привязки данных
+    mReportTypeCombo->addItem("Популярность книг (Топ-10)", "popularity_books");
+    mReportTypeCombo->addItem("Популярность жанров", "popularity_genres");
+    mReportTypeCombo->addItem("Активные читатели (Топ-10)", "activity_readers");
+    mReportTypeCombo->addItem("Текущие просрочки", "overdue_current");
+    mReportTypeCombo->addItem("Состав фонда по жанрам", "composition_genres");
+    // Можно добавить и другие типы
+
+    // Выпадающий список для фильтра по жанру (пример)
+    mGenreFilterCombo = new QComboBox();
+    mGenreFilterCombo->addItem("Все жанры", ""); // Пустое значение для 'Все'
+    // Важно: Этот комбобокс нужно заполнять динамически из БД
+
+    QPushButton *refreshGenresButton = new QPushButton(this); // Используем ЛОКАЛЬНУЮ переменную!
+    QIcon reloadIcon = this->style()->standardIcon(QStyle::SP_BrowserReload);
+    if (!reloadIcon.isNull()) { // Проверяем, нашлась ли иконка
+        refreshGenresButton->setIcon(reloadIcon);
+        refreshGenresButton->setFixedSize(refreshGenresButton->sizeHint()); // Размер по содержимому (иконка+отступы)
+        qDebug() << "Refresh Genres Button Icon loaded, size hint:" << refreshGenresButton->sizeHint();
+    } else {
+        refreshGenresButton->setText("Обн."); // Текст, если иконки нет
+        refreshGenresButton->setFixedSize(refreshGenresButton->fontMetrics().horizontalAdvance("Обн.") + 10, refreshGenresButton->sizeHint().height());
+        qWarning() << "Standard Reload Icon (SP_BrowserReload) not found, using text fallback for Refresh Genres Button.";
+    }
+    refreshGenresButton->setToolTip("Обновить список доступных жанров");
+    qDebug() << "Refresh Genres Button created";
+
+    QHBoxLayout *genreFilterLayout = new QHBoxLayout(); // Горизонтальный layout
+    genreFilterLayout->setContentsMargins(0,0,0,0);
+    genreFilterLayout->setSpacing(3);
+    genreFilterLayout->addWidget(mGenreFilterCombo, 1);  // Добавляем комбобокс, растягиваем его
+    genreFilterLayout->addWidget(refreshGenresButton);   // Добавляем кнопку обновления
+    qDebug() << "ComboBox and Button added to genreFilterLayout";
+
+    // Кнопка для запуска формирования отчета
+    mGenerateReportButton = new QPushButton("Сформировать отчет");
+
+    // Размещение виджетов фильтров в сетке
+    filterLayout->addWidget(new QLabel("Тип отчета:"), 0, 0);
+    filterLayout->addWidget(mReportTypeCombo, 0, 1, 1, 3); // Занимает 3 колонки
+    filterLayout->addWidget(new QLabel("Период с:"), 1, 0);
+    filterLayout->addWidget(mStartDateEdit, 1, 1);
+    filterLayout->addWidget(new QLabel("по:"), 1, 2);
+    filterLayout->addWidget(mEndDateEdit, 1, 3);
+    filterLayout->addWidget(new QLabel("Жанр (фильтр):"), 2, 0);
+    filterLayout->addLayout(genreFilterLayout, 2, 1, 1, 2);
+    filterLayout->addWidget(mGenerateReportButton, 2, 3); // Кнопка справа
+
+    mainLayout->addWidget(filterGroup); // Добавляем группу фильтров в основной layout
+
+    // --- Группа для отображения результатов отчета ---
+    QGroupBox* displayGroup = new QGroupBox("Результаты отчета");
+    QVBoxLayout* displayLayout = new QVBoxLayout(displayGroup);
+
+    // QStackedWidget для переключения между таблицей и графиком
+    mReportDisplayWidget = new QStackedWidget();
+
+    // Таблица для отображения детальных данных
+    mReportTableWidget = new QTableWidget();
+    mReportTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers); // Запрет редактирования
+    mReportTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows); // Выделение строк
+    mReportTableWidget->setSelectionMode(QAbstractItemView::SingleSelection); // Выделение одной строки
+    mReportTableWidget->setAlternatingRowColors(true); // Чередование цветов строк
+    mReportTableWidget->verticalHeader()->setVisible(false); // Скрыть вертикальные заголовки
+    mReportTableWidget->setSortingEnabled(true); // Разрешить сортировку по клику на заголовок
+
+    // Виджет для отображения графиков из Qt Charts
+    mReportChartView = new QtCharts::QChartView();
+    mReportChartView->setRenderHint(QPainter::Antialiasing); // Включить сглаживание
+
+    // Добавляем таблицу и виджет графика в QStackedWidget
+    mReportDisplayWidget->addWidget(mReportTableWidget); // Индекс 0
+    mReportDisplayWidget->addWidget(mReportChartView);   // Индекс 1
+
+    // Добавляем QStackedWidget в layout группы отображения, растягиваем его
+    displayLayout->addWidget(mReportDisplayWidget, 1);
+
+    // Добавляем группу отображения в основной layout, растягиваем ее
+    mainLayout->addWidget(displayGroup, 1);
+
+    // --- Кнопки "Назад" и "Экспорт" внизу экрана ---
+    QHBoxLayout* bottomButtonLayout = new QHBoxLayout();
+    mBackFromStatsButton = new QPushButton("Назад к библиотекарю");
+    mExportReportButton = new QPushButton("Экспорт отчета в CSV");
+    mExportReportButton->setEnabled(false); // Изначально кнопка экспорта неактивна
+
+    bottomButtonLayout->addWidget(mBackFromStatsButton);
+    bottomButtonLayout->addStretch(); // Пространство между кнопками
+    bottomButtonLayout->addWidget(mExportReportButton);
+    mainLayout->addLayout(bottomButtonLayout); // Добавляем кнопки в основной layout
+
+    // Добавляем созданный виджет экрана статистики в главный QStackedWidget приложения
+    mStackedWidget->addWidget(mStatsScreen);
+
+    // --- Подключение сигналов к слотам для элементов экрана статистики ---
+    connect(mGenerateReportButton, &QPushButton::clicked, this, &MainWindow::onGenerateReportClicked);
+    connect(mExportReportButton, &QPushButton::clicked, this, &MainWindow::onExportReportClicked);
+    connect(mBackFromStatsButton, &QPushButton::clicked, this, &MainWindow::onBackFromStatsClicked);
+    connect(refreshGenresButton, &QPushButton::clicked, this, &MainWindow::onRefreshGenresClicked);
+
+    // Опционально: сбрасывать отображение при изменении фильтров, чтобы было видно,
+    // что нужно нажать "Сформировать" для получения актуальных данных.
+    // auto clearDisplay = [this](){
+    //     mReportTableWidget->setRowCount(0);
+    //     if(mReportChartView->chart()) delete mReportChartView->chart();
+    //     mReportChartView->setChart(nullptr);
+    //     mReportDisplayWidget->setCurrentWidget(mReportTableWidget);
+    //     mExportReportButton->setEnabled(false);
+    // };
+    // connect(mReportTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, clearDisplay);
+    // connect(mStartDateEdit, &QDateEdit::dateChanged, this, clearDisplay);
+    // connect(mEndDateEdit, &QDateEdit::dateChanged, this, clearDisplay);
+    // connect(mGenreFilterCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, clearDisplay);
+}
+
+// Слот, вызываемый при нажатии кнопки "Сформировать отчет"
+void MainWindow::onGenerateReportClicked() {
+    // Получаем выбранный тип отчета (можно использовать currentData для привязки кода)
+    QString reportType = mReportTypeCombo->currentText();
+    QDate startDate = mStartDateEdit->date();
+    QDate endDate = mEndDateEdit->date();
+    // Получаем значение фильтра (например, жанр из currentData)
+    QString optionalFilter = mGenreFilterCombo->currentData().toString();
+
+    // Проверка корректности дат
+    if (startDate > endDate) {
+        QMessageBox::warning(this, "Ошибка даты", "Начальная дата не может быть позже конечной.");
+        return;
+    }
+
+    // Очистка предыдущих результатов перед новым запросом
+    mReportTableWidget->setRowCount(0); // Очищаем таблицу
+    mReportTableWidget->clearContents();
+
+    mReportDisplayWidget->setCurrentWidget(mReportTableWidget); // По умолчанию показываем пустую таблицу
+    mExportReportButton->setEnabled(false); // Деактивируем кнопку экспорта
+
+    // Вывод в лог и отправка запроса через клиента
+    qDebug() << "Requesting report:" << reportType
+             << "From:" << startDate.toString(Qt::ISODate)
+             << "To:" << endDate.toString(Qt::ISODate)
+             << "Filter:" << optionalFilter;
+    Client::get_instance().getStatisticsReport(reportType, startDate, endDate, optionalFilter);
+
+    // Уведомление пользователя об отправке запроса (можно заменить на индикатор загрузки)
+    mResponseTextEdit->append("Запрос отчета '" + reportType + "' отправлен...");
+}
+
+// Слот для обработки ответа сервера с ТАБЛИЧНЫМИ данными отчета
+void MainWindow::handleStatisticsReportReceived(const QString& reportType, const QStringList& headers, const QStringList& data) {
+    qDebug() << "Received table report data for:" << reportType << "Headers:" << headers.count() << "Data rows:" << data.count();
+    mResponseTextEdit->append("Отчет '" + reportType + "' (таблица) получен.");
+
+    // Проверка, что пользователь все еще на экране статистики
+    if (mStackedWidget->currentWidget() != mStatsScreen) {
+        qDebug() << "Report received, but user is not on the Stats screen anymore.";
+        return; // Не отображаем данные, если пользователь ушел с экрана
+    }
+    // Проверка, что тип полученного отчета совпадает с текущим выбором пользователя
+    if (reportType != mReportTypeCombo->currentText()) {
+        qDebug() << "Report type mismatch. Expected:" << mReportTypeCombo->currentText() << "Received:" << reportType;
+        return; // Пришел ответ на предыдущий запрос, игнорируем
+    }
+
+    // Отображаем данные в таблице
+    displayStatisticsReport(headers, data);
+    // Переключаем QStackedWidget на отображение таблицы
+    mReportDisplayWidget->setCurrentWidget(mReportTableWidget);
+    // Активируем кнопку экспорта, если есть данные
+    mExportReportButton->setEnabled(!data.isEmpty());
+}
+
+// Слот для обработки ответа сервера с данными для ГРАФИКА
+void MainWindow::handleChartDataReceived(const QString& reportType, const QStringList& labels, const QList<qreal>& values) {
+    qDebug() << "Received chart data for:" << reportType << "Labels:" << labels.count() << "Values:" << values.count();
+    mResponseTextEdit->append("Отчет '" + reportType + "' (график) получен.");
+
+    // Проверки, аналогичные handleStatisticsReportReceived
+    if (mStackedWidget->currentWidget() != mStatsScreen) {
+        qDebug() << "Chart data received, but user is not on the Stats screen anymore.";
+        return;
+    }
+    if (reportType != mReportTypeCombo->currentText()) {
+        qDebug() << "Chart data type mismatch. Expected:" << mReportTypeCombo->currentText() << "Received:" << reportType;
+        return;
+    }
+
+    // Строим и отображаем график
+    displayChart(reportType, labels, values, reportType); // Используем тип отчета как заголовок
+    // Переключаем QStackedWidget на отображение графика
+    mReportDisplayWidget->setCurrentWidget(mReportChartView);
+    // Активируем кнопку экспорта, если есть данные
+    mExportReportButton->setEnabled(!labels.isEmpty() && !values.isEmpty());
+}
+
+// Метод для отображения ТАБЛИЧНОГО отчета в mReportTableWidget
+void MainWindow::displayStatisticsReport(const QStringList& headers, const QStringList& data) {
+    mReportTableWidget->clearSelection(); // Сбрасываем выделение
+    mReportTableWidget->setSortingEnabled(false); // Отключаем сортировку на время заполнения
+    mReportTableWidget->setColumnCount(headers.count()); // Устанавливаем количество колонок
+    mReportTableWidget->setHorizontalHeaderLabels(headers); // Устанавливаем заголовки
+    mReportTableWidget->setRowCount(0); // Очищаем строки перед заполнением
+
+    // Заполняем таблицу данными построчно
+    for (const QString &rowData : data) {
+        // Разделяем строку данных на отдельные значения (предполагаем разделитель ',')
+        // Важно: сервер должен использовать именно этот разделитель
+        QStringList rowValues = rowData.split(',');
+        // Проверка соответствия количества значений и заголовков
+        if (rowValues.count() != headers.count()) {
+            qWarning() << "Row data column count mismatch:" << rowData << "(expected" << headers.count() << ")";
+            continue; // Пропускаем некорректную строку
+        }
+
+        int currentRow = mReportTableWidget->rowCount();
+        mReportTableWidget->insertRow(currentRow); // Вставляем новую строку
+
+        // Заполняем ячейки в новой строке
+        for (int col = 0; col < rowValues.count(); ++col) {
+            // Попытка преобразовать значение в число для корректной сортировки
+            bool isNumber;
+            double numericValue = rowValues[col].toDouble(&isNumber);
+            QTableWidgetItem* item;
+            if (isNumber) {
+                // Если это число, создаем item и сохраняем данные как число
+                item = new QTableWidgetItem();
+                item->setData(Qt::DisplayRole, numericValue);
+            } else {
+                // Если не число, создаем item с текстовым значением
+                item = new QTableWidgetItem(rowValues[col]);
+            }
+            // Запрещаем редактирование ячеек
+            item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+            mReportTableWidget->setItem(currentRow, col, item); // Вставляем item в ячейку
+        }
+    }
+
+    mReportTableWidget->resizeColumnsToContents(); // Автоматически изменяем размер колонок по содержимому
+    // Растягиваем последнюю колонку (или можно выбрать другую по индексу)
+    if (headers.count() > 0) {
+        mReportTableWidget->horizontalHeader()->setStretchLastSection(true);
+    }
+    mReportTableWidget->setSortingEnabled(true); // Включаем сортировку после заполнения
+}
+
+// Метод для отображения ГРАФИКА в mReportChartView
+void MainWindow::displayChart(const QString& title, const QStringList& labels, const QList<qreal>& values, const QString& reportType) {
+    using namespace QtCharts; // Для удобства использования классов QtCharts
+
+    // Создаем новый объект графика
+    QChart *chart = new QChart();
+    chart->setTitle(title); // Устанавливаем заголовок графика
+    chart->setAnimationOptions(QChart::SeriesAnimations); // Включаем анимацию для серий данных
+
+    // --- Выбор и настройка типа графика в зависимости от типа отчета ---
+    // (Пример: используем круговую для жанров, столбчатую для остального)
+    if (reportType.contains("жанр", Qt::CaseInsensitive) || reportType.contains("состав", Qt::CaseInsensitive)) {
+        // --- Круговая диаграмма (Pie Chart) ---
+        QPieSeries *series = new QPieSeries(chart);
+        // Заполняем серию данными (метки и значения)
+        for (int i = 0; i < labels.count() && i < values.count(); ++i) {
+            if (values[i] > 0) { // Добавляем только срезы с ненулевым значением
+                // Метка среза = название категории + значение в скобках
+                series->append(QString("%1 (%2)").arg(labels[i]).arg(QString::number(values[i], 'f', 0)), // 'f', 0 - без дробной части
+                               values[i]);
+            }
+        }
+        series->setLabelsVisible(true); // Показать метки прямо на срезах
+        // Можно настроить положение меток: series->setLabelsPosition(QPieSlice::LabelOutside);
+        chart->addSeries(series); // Добавляем серию на график
+        chart->legend()->setAlignment(Qt::AlignRight); // Размещаем легенду справа
+        chart->legend()->setVisible(true); // Показываем легенду
+
+    } else {
+        // --- Столбчатая диаграмма (Bar Chart) ---
+        QBarSeries *series = new QBarSeries(chart);
+        QBarSet *set = new QBarSet("Количество"); // Название одного набора столбцов
+
+        // Заполняем набор данными (значениями)
+        for (const qreal &value : values) {
+            *set << value;
+        }
+        series->append(set); // Добавляем набор в серию
+        chart->addSeries(series); // Добавляем серию на график
+
+        // Настройка оси X (категории)
+        QBarCategoryAxis *axisX = new QBarCategoryAxis();
+        axisX->append(labels); // Добавляем метки категорий из labels
+        chart->setAxisX(axisX, series); // Привязываем ось X к серии данных
+
+        // Настройка оси Y (значения)
+        QValueAxis *axisY = new QValueAxis();
+        axisY->setTitleText("Количество"); // Подпись оси Y
+        axisY->applyNiceNumbers(); // Делает деления на оси "красивыми" (круглыми)
+        // Убедимся, что минимальное значение 0, если все значения >= 0
+        if (std::all_of(values.constBegin(), values.constEnd(), [](qreal v){ return v >= 0; })) {
+            axisY->setMin(0);
+        }
+        chart->setAxisY(axisY, series); // Привязываем ось Y к серии данных
+
+        chart->legend()->setVisible(false); // Легенда обычно не нужна для одного набора данных
+        chart->legend()->setAlignment(Qt::AlignBottom); // На всякий случай
+    }
+
+
+    // --- Установка созданного графика в QChartView ---
+    // Перед установкой нового графика, удаляем старый, если он был
+    mReportChartView->setChart(chart); // Установка нового графика
+}
+
+// Слот для кнопки "Экспорт отчета в CSV"
+void MainWindow::onExportReportClicked() {
+    QString reportType = mReportTypeCombo->currentText();
+    qDebug() << "Exporting report:" << reportType;
+
+    // Формируем имя файла по умолчанию
+    QString defaultFileName = reportType.replace(QRegularExpression("[^a-zA-Z0-9а-яА-Я]+"), "_")
+                              + "_" + QDate::currentDate().toString("yyyyMMdd") + ".csv";
+
+    // Запрашиваем у пользователя путь для сохранения файла
+    QString filePath = QFileDialog::getSaveFileName(this,
+                                                    tr("Экспорт отчета в CSV"),
+                                                    QDir::homePath() + "/" + defaultFileName, // Путь по умолчанию
+                                                    tr("CSV Files (*.csv);;All Files (*)")); // Фильтр файлов
+    if (filePath.isEmpty()) {
+        return; // Пользователь нажал "Отмена"
+    }
+
+    QFile file(filePath);
+    // Пытаемся открыть файл для записи в текстовом режиме
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::critical(this, "Ошибка экспорта", "Не удалось открыть файл для записи:\n" + file.errorString());
+        return;
+    }
+    QTextStream out(&file);
+    out.setCodec("UTF-8"); // Устанавливаем кодировку UTF-8 для поддержки кириллицы
+
+    QString csvData; // Здесь будем формировать CSV строку
+
+    // --- Сбор данных в зависимости от того, что отображается (таблица или график) ---
+    QWidget *currentReportWidget = mReportDisplayWidget->currentWidget();
+
+    if (currentReportWidget == mReportTableWidget) {
+        // --- Экспорт из таблицы ---
+        qDebug() << "Exporting from TableWidget";
+        QStringList headers;
+        // Собираем заголовки
+        for (int j = 0; j < mReportTableWidget->columnCount(); ++j) {
+            headers << escapeCsvField(mReportTableWidget->horizontalHeaderItem(j)->text());
+        }
+        csvData += headers.join(",") + "\r\n"; // Добавляем строку заголовков
+
+        // Собираем данные строк
+        for (int i = 0; i < mReportTableWidget->rowCount(); ++i) {
+            QStringList rowData;
+            for (int j = 0; j < mReportTableWidget->columnCount(); ++j) {
+                QTableWidgetItem *item = mReportTableWidget->item(i, j);
+                QString value = item ? item->text() : ""; // Получаем текстовое значение ячейки
+                rowData << escapeCsvField(value); // Экранируем и добавляем
+            }
+            csvData += rowData.join(",") + "\r\n"; // Добавляем строку данных
+        }
+    }
+    else if (currentReportWidget == mReportChartView && mReportChartView->chart()) {
+        // --- Экспорт из графика ---
+        qDebug() << "Exporting from ChartView";
+        // --- ИСПРАВЛЕНИЕ: Добавляем пространство имен ---
+        QtCharts::QChart* chart = mReportChartView->chart();
+        QStringList headers;
+        headers << escapeCsvField("Категория") << escapeCsvField("Значение"); // Общие заголовки для графиков
+        csvData += headers.join(",") + "\r\n";
+
+        // Проверяем тип первой серии данных для определения типа графика
+        if (chart->series().isEmpty()) {
+            qDebug() << "Chart has no series to export.";
+        } else {
+            // --- ИСПРАВЛЕНИЕ: Добавляем пространство имен ---
+            QtCharts::QAbstractSeries* abstractSeries = chart->series().first();
+                // --- ИСПРАВЛЕНИЕ: Добавляем пространство имен ---
+            if (auto pieSeries = dynamic_cast<QtCharts::QPieSeries*>(abstractSeries)) { // Pie Chart
+                qDebug() << "Exporting PieSeries data";
+                // --- ИСПРАВЛЕНИЕ: Добавляем пространство имен ---
+                for (QtCharts::QPieSlice *slice : pieSeries->slices()) {
+                    QString category = slice->label().section('(', 0, 0).trimmed(); // Берем метку до скобки
+                    QString value = QString::number(slice->value());
+                    csvData += escapeCsvField(category) + "," + escapeCsvField(value) + "\r\n";
+                }
+                // --- ИСПРАВЛЕНИЕ: Добавляем пространство имен ---
+            } else if (auto barSeries = dynamic_cast<QtCharts::QBarSeries*>(abstractSeries)) { // Bar Chart
+                qDebug() << "Exporting BarSeries data";
+                if (!barSeries->barSets().isEmpty()) {
+                    QtCharts::QBarSet *set = barSeries->barSets().first();
+                        // --- ИСПРАВЛЕНИЕ: Добавляем пространство имен ---
+                    QtCharts::QBarCategoryAxis *axisX = dynamic_cast<QtCharts::QBarCategoryAxis*>(chart->axisX(barSeries));
+                    if (axisX) {
+                        QStringList categories = axisX->categories();
+                        for (int i = 0; i < set->count() && i < categories.count(); ++i) {
+                            QString category = categories.at(i);
+                            QString value = QString::number(set->at(i));
+                            csvData += escapeCsvField(category) + "," + escapeCsvField(value) + "\r\n";
+                        }
+                    } else {
+                        qDebug() << "Could not find CategoryAxis for BarSeries export.";
+                    }
+                } else {
+                    qDebug() << "BarSeries has no BarSets to export.";
+                }
+            } else {
+                // Добавить обработку других типов графиков, если необходимо
+                qDebug() << "Unhandled chart series type for export:" << abstractSeries->type();
+                QMessageBox::warning(this, "Экспорт", "Не удалось определить данные для экспорта из текущего графика.");
+                file.close(); // Закрываем файл перед выходом
+                return;
+            }
+        } // конец проверки if (chart->series().isEmpty())
+        } else {
+        // Случай, если нет ни таблицы, ни графика (не должно происходить при активной кнопке)
+        QMessageBox::warning(this, "Экспорт", "Нет данных для экспорта.");
+        file.close();
+        return;
+    } // конец проверки currentReportWidget
+
+    // Записываем сформированные CSV данные в файл
+    out << csvData;
+    file.close(); // Закрываем файл после записи
+
+    // Проверка статуса потока и информирование пользователя
+    if (out.status() != QTextStream::Ok) {
+        QMessageBox::critical(this, "Ошибка экспорта", "Произошла ошибка при записи данных в файл.");
+    } else {
+        QMessageBox::information(this, "Экспорт завершен", "Отчет успешно сохранен в файл:\n" + filePath);
+    }
+}
+
+// --> Утилитарная функция для экранирования полей CSV <--
+// Добавлена для корректной работы экспорта
+QString MainWindow::escapeCsvField(const QString &field) {
+    QString result = field;
+    // 1. Заменяем все внутренние кавычки на двойные кавычки
+    result.replace("\"", "\"\"");
+    // 2. Если поле содержит запятую, кавычку, точку с запятой или символ новой строки,
+    //    то заключаем все поле в кавычки.
+    if (result.contains(',') || result.contains('"') || result.contains(';') || result.contains('\n') || result.contains('\r')) {
+        result = "\"" + result + "\"";
+    }
+    return result;
 }
 
 // =============================================
@@ -1055,10 +1576,11 @@ void MainWindow::setupLibrarianScreen() {
     mOverdueRentalsLabel = new QLabel("..."); statsLayout->addWidget(mOverdueRentalsLabel, 5, 1);
 
     mRefreshStatsButton = new QPushButton("Обновить статистику", this);
+    mShowStatsScreenButton = new QPushButton("Отчетность", this);
     statsLayout->addWidget(mRefreshStatsButton, 6, 0, 1, 2, Qt::AlignCenter); // Кнопка под статистикой по центру
+    statsLayout->addWidget(mShowStatsScreenButton, 6, 1, Qt::AlignCenter);
 
     statsLayout->setColumnStretch(1, 1); // Растянуть колонку со значениями
-
     rightColumnLayout->addWidget(mStatsGroup); // Добавляем статистику в ПРАВУЮ колонку
 
 
@@ -1198,6 +1720,8 @@ void MainWindow::setupLibrarianScreen() {
     connect(mResetPasswordButton, &QPushButton::clicked, this, &MainWindow::onResetPasswordClicked);
     connect(mChangeEmailButton, &QPushButton::clicked, this, &MainWindow::onChangeEmailClicked);
 
+    // Connect для новой кнопки перехода на экран статистики
+    connect(mShowStatsScreenButton, &QPushButton::clicked, this, &MainWindow::onShowStatsScreenClicked);
     // Connect для кнопки обновления статистики
     connect(mRefreshStatsButton, &QPushButton::clicked, this, &MainWindow::onRefreshStatsClicked);
 }
@@ -1626,6 +2150,7 @@ void MainWindow::handleExportCsvData(const QString& csvData) {
 
     QTextStream out(&file);
     out.setCodec("UTF-8"); // Устанавливаем кодировку UTF-8
+    out.setGenerateByteOrderMark(true); // 2. Включаем генерацию BOM для UTF-8
     out << csvData;
     file.close();
 
@@ -1830,3 +2355,60 @@ void MainWindow::handleLibraryStats(int totalBooks, int availableBooks, int rent
     mActiveRentalsLabel->setText(QString::number(activeRentals));
     mOverdueRentalsLabel->setText(QString::number(overdueRentals));
 }
+
+// Заполнение QComboBox жанрами
+void MainWindow::handleGenresList(const QStringList& genres) {
+    qDebug() << "Populating genre filter combo box with" << genres.count() << "genres.";
+    qDebug() << "[GUI] handleGenresList SLOT CALLED with genres:" << genres;
+
+    // Проверяем, существует ли виджет (на всякий случай)
+    if (!mGenreFilterCombo) {
+        qWarning() << "Genre filter combo box (mGenreFilterCombo) is null!";
+        return;
+    }
+
+    // Запоминаем текущий выбранный элемент (если он был)
+    QString currentSelectionData = mGenreFilterCombo->currentData().toString();
+
+    mGenreFilterCombo->blockSignals(true);
+
+    // Очищаем комбобокс (кроме первого элемента "Все жанры")
+    mGenreFilterCombo->clear();
+    mGenreFilterCombo->addItem("Все жанры", ""); // Добавляем опцию "Все"
+
+    // Добавляем полученные жанры
+    for (const QString& genre : genres) {
+        // Добавляем элемент: видимый текст = genre, данные = genre
+        mGenreFilterCombo->addItem(genre, genre);
+    }
+
+    // Пытаемся восстановить предыдущий выбор, если он был
+    int indexToRestore = mGenreFilterCombo->findData(currentSelectionData);
+    if (indexToRestore != -1) {
+        mGenreFilterCombo->setCurrentIndex(indexToRestore);
+    } else {
+        mGenreFilterCombo->setCurrentIndex(0); // Выбираем "Все жанры" по умолчанию
+    }
+
+    // Разблокируем сигналы и комбобокс
+    mGenreFilterCombo->blockSignals(false);
+    mGenreFilterCombo->setEnabled(true);
+}
+
+void MainWindow::onRefreshGenresClicked() {
+    qDebug() << "Refresh Genres button clicked. Requesting genres list...";
+    // Опционально: Показать индикацию загрузки для комбобокса, пока идет запрос
+    if (mGenreFilterCombo) {
+        QString currentGenre = mGenreFilterCombo->currentText(); // Сохраняем на всякий случай
+        mGenreFilterCombo->blockSignals(true);
+        mGenreFilterCombo->clear();
+        mGenreFilterCombo->addItem("Обновление...");
+        mGenreFilterCombo->setEnabled(false);
+        mGenreFilterCombo->blockSignals(false);
+    }
+    // Отправляем запрос на сервер
+    Client::get_instance().requestGenresList();
+    // Результат придет в уже существующий слот handleGenresList,
+    // который и обновит комбобокс реальными данными и сделает его активным.
+}
+

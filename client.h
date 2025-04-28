@@ -5,6 +5,7 @@
 #include <QTcpSocket>
 #include <QString>
 #include <QDebug>
+#include <QDate>
 
 class Client : public QObject
 {
@@ -77,6 +78,15 @@ public:
     // Новый метод для запроса статистики
     void getLibraryStats();
 
+    // Новый метод для запроса ДЕТАЛЬНЫХ ОТЧЕТОВ
+    void getStatisticsReport(const QString& reportType,      // Тип запрашиваемого отчета
+                             const QDate& startDate,       // Начальная дата периода
+                             const QDate& endDate,         // Конечная дата периода
+                             const QString& optionalFilter = ""); // Опциональный фильтр (например, жанр)
+
+    // Запросить список жанров у сервера
+    void requestGenresList();
+
 signals:
     void publicUserInfoReceived(int id, const QString& login, const QString& email);
     void booksListReceived(const QStringList& books);
@@ -99,6 +109,16 @@ signals:
     // Новый сигнал для статистики
     void libraryStatsReceived(int totalBooks, int availableBooks, int rentedBooks,
                               int totalClients, int activeRentals, int overdueRentals);
+    // Новые сигналы для обработки ответов на детальные отчеты
+    // Сигнал для получения ТАБЛИЧНЫХ данных отчета
+    // Параметры: тип отчета, список заголовков, список строк данных (каждая строка - "val1,val2,...")
+    void statisticsReportReceived(const QString& reportType, const QStringList& headers, const QStringList& data);
+
+    // Сигнал для получения данных для построения ГРАФИКА
+    // Параметры: тип отчета, список меток для осей/срезов, список числовых значений
+    void chartDataReceived(const QString& reportType, const QStringList& labels, const QList<qreal>& values);
+    void genresListReceived(const QStringList& genres);
+
 
 private slots:
     void onReadyRead();

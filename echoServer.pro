@@ -8,6 +8,8 @@
 
     QT += sql
 
+    QT += charts
+
     QT += widgets
 
     CONFIG += c++11 console

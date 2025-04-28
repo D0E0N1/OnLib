@@ -326,17 +326,126 @@ void Client::onReadyRead() {
             debts = parts[1].split('|');
         }
         emit userDebtsReceived(debts);
+    } // Новая обработка ответов на ДЕТАЛЬНЫЕ ОТЧЕТЫ
+    else if (command == "report_table_data+") {
+        // Ответ с ТАБЛИЧНЫМИ данными
+        // Ожидаемый формат: report_table_data+ & ТипОтчета & Заголовок1,Заголовок2 & Данные11,Данные12|Данные21,Данные22...
+        if (parts.size() >= 4) { // Должно быть как минимум 4 части
+            QString reportType = parts[1]; // Тип отчета
+            QStringList headers = parts[2].split(','); // Заголовки, разделенные запятой
+            QString rawData = parts[3]; // Строка с данными (разделеными '|') или пустая
+
+            QStringList dataRows;
+            // Обрабатываем случай, когда данные не пустые
+            if (!rawData.isEmpty()) {
+                // Строки данных, разделенные '|'
+                // Если символ '|' отсутствует, но строка данных не пуста, значит, пришла одна строка данных
+                if (!rawData.contains('|')) {
+                    dataRows.append(rawData);
+                } else {
+                    // Если '|' есть, разделяем как обычно, но пропускаем пустые строки (может быть '|' в конце)
+                    dataRows = rawData.split('|', Qt::SkipEmptyParts);
+                }
+            }
+            // Иначе dataRows останется пустым (если rawData был пуст)
+
+            qDebug() << "[Client] Emitting statisticsReportReceived for" << reportType
+                     << "Headers:" << headers.count() << "Rows:" << dataRows.count();
+            // Испускаем сигнал с полученными данными
+            emit statisticsReportReceived(reportType, headers, dataRows);
+        } else {
+            // Ошибка: неверный формат ответа от сервера
+            qWarning() << "Invalid format for report_table_data+ response (expected 4+ parts):" << responseStr;
+            emit operationStatusReceived(false, "Сервер прислал некорректный формат табличного отчета.");
+        }
     }
+    else if (command == "report_chart_data+") {
+        // Ответ с данными для ГРАФИКА
+        // Ожидаемый формат: report_chart_data+ & ТипОтчета & Метка1,Метка2 & Значение1,Значение2
+        if (parts.size() == 4) { // Ровно 4 части
+            QString reportType = parts[1]; // Тип отчета
+            QStringList labels = parts[2].split(','); // Метки, разделенные запятой
+            QStringList valueStrings = parts[3].split(','); // Значения (как строки), разделенные запятой
+
+            QList<qreal> values; // Список для числовых значений
+            bool conversionOk = true; // Флаг успешности конвертации
+
+            // Пытаемся сконвертировать строковые значения в числа (qreal)
+            for (const QString& s : valueStrings) {
+                if (s.isEmpty() && valueStrings.count() == 1) { // Сервер может прислать пустую строку если данных нет
+                    qDebug() << "Received empty value string for chart data.";
+                    break; // Выходим, values останется пустым
+                }
+                bool ok;
+                qreal val = s.toDouble(&ok);
+                if (!ok) {
+                    conversionOk = false; // Ошибка конвертации
+                    qWarning() << "Failed to convert chart value to double:" << s;
+                    break;
+                }
+                values.append(val); // Добавляем сконвертированное значение
+            }
+
+            // Проверяем, что конвертация прошла успешно И количество меток совпадает с количеством значений
+            if (conversionOk && labels.count() == values.count()) {
+                qDebug() << "[Client] Emitting chartDataReceived for" << reportType << "Labels:" << labels.count();
+                // Испускаем сигнал с данными для графика
+                emit chartDataReceived(reportType, labels, values);
+            } else if (labels.count() != values.count()) {
+                qWarning() << "Label/Value count mismatch for report_chart_data+ response:" << responseStr
+                           << "Labels:" << labels.count() << "Values:" << values.count();
+                emit operationStatusReceived(false, "Ошибка в данных для графика от сервера (несовпадение количества).");
+            } else { // Ошибка конвертации conversionOk == false
+                emit operationStatusReceived(false, "Ошибка в данных для графика от сервера (нечисловые значения).");
+            }
+        } else {
+            // Ошибка: неверный формат ответа от сервера
+            qWarning() << "Invalid format for report_chart_data+ response (expected 4 parts):" << responseStr;
+            emit operationStatusReceived(false, "Сервер прислал некорректный формат данных для графика.");
+        }
+    } // Ответ со списком жанров
+    else if (command == "genres_list+") {
+        // Ожидаем: genres_list+&жанр1,жанр2,жанр3...
+        QStringList genres;
+        if (parts.size() == 2 && !parts[1].isEmpty()) {
+            genres = parts[1].split(','); // Разделяем строку жанров по запятой
+        } else if (parts.size() == 1) {
+            // Сервер прислал genres_list+, но без данных (нет жанров в БД?)
+            qDebug() << "Received empty genres list from server.";
+        } else {
+            qWarning() << "Invalid format for genres_list+ response:" << responseStr;
+            emit operationStatusReceived(false, "Некорректный формат списка жанров от сервера.");
+        }
+        // В любом случае (даже если список пуст) испускаем сигнал
+        qDebug() << "[Client] Emitting genresListReceived with" << genres.count() << "genres.";
+        qDebug() << "[Client] Parsed genres before emitting:" << genres;
+        emit genresListReceived(genres);
+    }
+
     else if (command.endsWith('+')) {
         emit operationStatusReceived(true, "Operation successful");
     }
     else if (command.endsWith('-')) {
         QString errorMsg = parts.size() > 1 ? parts[1] : "Operation failed";
+        if (command == "report_data-") {
+            errorMsg = "Ошибка формирования отчета на сервере: " + errorMsg;
+        } else if (command == "genres_list-") {
+            errorMsg = "Ошибка получения списка жанров: " + errorMsg;
+        }
         emit operationStatusReceived(false, errorMsg);
     }
 
+    else {
+        // Неизвестная команда от сервера
+        qWarning() << "Received unknown command from server:" << command;
+        // Можно просто проигнорировать или показать общее сообщение
+        // emit operationStatusReceived(false, "Получен неизвестный ответ от сервера: " + command);
+    }
+
+    // Общий сигнал для отображения сырого ответа в логе (независимо от успеха/ошибки)
     emit responseReceived(responseStr);
 }
+
 
 void Client::onDisconnected() {
     qDebug() << "Disconnected from server";
@@ -439,3 +548,20 @@ void Client::getLibraryStats() {
     sendRequest("get_library_stats");
 }
 
+// --- Новый метод для запроса ДЕТАЛЬНЫХ ОТЧЕТОВ ---
+void Client::getStatisticsReport(const QString& reportType, const QDate& startDate, const QDate& endDate,
+                                 const QString& optionalFilter) {
+    // Формируем строку запроса к серверу
+    // Формат: get_statistics_report&ТипОтчета&ДатаНачала&ДатаКонца&Фильтр
+    QString request = QString("get_statistics_report&%1&%2&%3&%4")
+                          .arg(reportType)                      // Тип отчета
+                          .arg(startDate.toString(Qt::ISODate)) // Дата начала в формате yyyy-MM-dd
+                          .arg(endDate.toString(Qt::ISODate))   // Дата конца в формате yyyy-MM-dd
+                          .arg(optionalFilter);                 // Опциональный фильтр (может быть пустым)
+    sendRequest(request); // Отправляем сформированный запрос на сервер
+}
+
+// Реализация запроса жанров
+void Client::requestGenresList() {
+    sendRequest("get_genres_list"); // Команда серверу для получения жанров
+}

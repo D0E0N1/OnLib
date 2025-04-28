@@ -56,6 +56,13 @@ private:
 
     // Новый обработчик для статистики
     QString handleGetLibraryStats(const QStringList& parts);
+
+
+    // Новый обработчик для ДЕТАЛЬНЫХ ОТЧЕТОВ
+    QString handleGetStatisticsReport(const QStringList& parts);
+
+    // Запрос списка жанров
+    QString handleGetGenresList(const QStringList& parts);
 };
 
 #endif // COMMANDHANDLER_H

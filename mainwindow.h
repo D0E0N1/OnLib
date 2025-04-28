@@ -17,6 +17,19 @@
 #include <QMenu>
 #include <QMenuBar>
 
+#include <QDateEdit>
+#include <QtCharts/QChartView> // Для отображения графиков
+#include <QtCharts/QChart>     // Сам график
+
+QT_BEGIN_NAMESPACE
+
+namespace QtCharts {
+class QChartView;
+class QChart;
+}
+
+QT_END_NAMESPACE
+
 // Пользовательский класс клиента
 #include "client.h"
 
@@ -34,6 +47,12 @@ private slots: // Слоты для обработки сигналов (нап�
     // --- Navigation Slots ---
     void onRegButtonClicked();       // Переход на экран регистрации
     void onAuthButtonClicked();      // Переход на экран аутентификации
+
+    // --> Новый слот: Показать экран статистики <--
+    void onShowStatsScreenClicked();
+    // --> Новый слот: Вернуться с экрана статистики <--
+    void onBackFromStatsClicked();
+
     void onBackButtonClicked();      // Возврат на главный экран / Выход из аккаунта
     void onSendRegButtonClicked();   // Отправка запроса на регистрацию
     void onSendAuthButtonClicked();  // Отправка запроса на аутентификацию
@@ -98,6 +117,20 @@ private slots: // Слоты для обработки сигналов (нап�
     void handleLibraryStats(int totalBooks, int availableBooks, int rentedBooks,
                             int totalClients, int activeRentals, int overdueRentals);
 
+    // Новые слоты для экрана статистики
+    void onGenerateReportClicked();     // Слот для кнопки "Сформировать отчет"
+    void onExportReportClicked();       // Слот для кнопки "Экспорт отчета"
+    // Слот для обработки ответа сервера с ТАБЛИЧНЫМИ данными
+    void handleStatisticsReportReceived(const QString& reportType, const QStringList& headers, const QStringList& data);
+    // Слот для обработки ответа сервера с данными для ГРАФИКА
+    void handleChartDataReceived(const QString& reportType, const QStringList& labels, const QList<qreal>& values);
+
+    // Обработка полученного списка жанров
+    void handleGenresList(const QStringList& genres);
+
+    void onRefreshGenresClicked();
+
+
 private: // Приватные методы и члены класса
 
     void setupMenus();
@@ -109,6 +142,7 @@ private: // Приватные методы и члены класса
     void setupClientScreen();     // Настройка экрана клиента
     void setupLibrarianScreen();  // Настройка экрана библиотекаря
     void setupAnnotationScreen();
+    void setupStatsScreen();
 
     // --- Table Population / Display Methods ---
     void showBookStatsTable(const QStringList& stats);             // Заполнение таблицы статистики клиента
@@ -121,8 +155,17 @@ private: // Приватные методы и члены класса
     // Новый метод для заполнения таблицы истории
     void populateHistoryTable(const QStringList& history);
 
+    // Новые методы для отображения отчетов
+    // Метод для отображения табличного отчета
+    void displayStatisticsReport(const QStringList& headers, const QStringList& data);
+    // Метод для отображения графика
+    void displayChart(const QString& title, const QStringList& labels, const QList<qreal>& values, const QString& reportType);
+
 
     int getSelectedUserIdFromTable(QTableWidget* table);
+
+    // Новая утилитарная функция для экранирования CSV полей
+    QString escapeCsvField(const QString &field);
 
     // --- UI Member Variables ---
     QStackedWidget *mStackedWidget; // Виджет для переключения экранов
@@ -195,8 +238,6 @@ private: // Приватные методы и члены класса
     // Навигация
     QPushButton *mLibrarianBackButton;
 
-    // Response display area (Общее для всех экранов)
-    QTextEdit *mResponseTextEdit;
 
     // Виджет и элементы экрана редактирования аннотации
     QWidget *mAnnotationScreen;
@@ -240,6 +281,29 @@ private: // Приватные методы и члены класса
     QLabel      *mActiveRentalsLabel;
     QLabel      *mOverdueRentalsLabel;
     QPushButton *mRefreshStatsButton;
+
+    // Новая кнопка на экране библиотекаря для перехода к отчетности
+    QPushButton *mShowStatsScreenButton;
+
+    // Response display area (Общее для всех экранов)
+    QTextEdit *mResponseTextEdit;
+
+    // Новые элементы UI для экрана детальной статистики/отчетов
+    QWidget            *mStatsScreen;           // Виджет для экрана статистики
+    QDateEdit          *mStartDateEdit;       // Выбор начальной даты
+    QDateEdit          *mEndDateEdit;         // Выбор конечной даты
+    QComboBox          *mReportTypeCombo;     // Выбор типа отчета
+    QComboBox          *mGenreFilterCombo;    // Пример фильтра (по жанру)
+    QPushButton        *mGenerateReportButton;// Кнопка "Сформировать отчет"
+    QPushButton        *mExportReportButton;  // Кнопка "Экспорт отчета в CSV"
+    QPushButton        *mBackFromStatsButton; // Кнопка "Назад" к библиотекарю
+
+    // Виджет для переключения между таблицей и графиком
+    QStackedWidget     *mReportDisplayWidget;
+    // Таблица для детального отображения данных отчета
+    QTableWidget       *mReportTableWidget;
+    // Виджет для отображения графика (из QtCharts)
+    QtCharts::QChartView *mReportChartView;
 
 };
 

@@ -27,7 +27,11 @@ QString CommandHandler::handleRequest(const QString& command,
         // ★ Добавляем обработку НОВЫХ команд перед другими
         if (command == "get_book_annotation") {
             return handleGetBookAnnotation(parts);
-        } else if (command == "update_book_annotation") {
+        }else if (command == "get_genres_list") {
+            // Получение списка жанров может быть доступно и клиенту? Решим, что да.
+            // Проверка роли библиотекаря здесь не нужна.
+            return handleGetGenresList(parts);
+        }else if (command == "update_book_annotation") {
             if (clientRole != "librarian") return "error&Permission denied\r\n";
             return handleUpdateBookAnnotation(parts);
         }else if (command == "import_books_csv") {
@@ -60,6 +64,9 @@ QString CommandHandler::handleRequest(const QString& command,
             if (clientRole != "librarian") return "error&Permission denied\r\n";
             if (clientUserId == -1) return "error&Authentication required\r\n";
             return handleGetLibraryStats(parts);
+        } // Новый обработчик ДЕТАЛЬНОЙ статистики
+        else if (command == "get_statistics_report"){
+            return handleGetStatisticsReport(parts);
         }else if (command == "get_all_users") {
             // Проверка аутентификации И роли здесь
             if (clientUserId == -1) return "error&Authentication required\r\n";
@@ -152,7 +159,10 @@ QString CommandHandler::handleRequest(const QString& command,
             return handleUpdateUserEmail(parts);
         }
 
-        return "error&Unknown command\r\n";
+        else { // Добавь этот else
+            qWarning() << "Unknown command received:" << command; // Для отладки добавь лог
+            return "error&Unknown command\r\n";
+        }
     }
     catch (const std::exception& e) {
         qCritical() << "Error handling request:" << e.what();
@@ -674,4 +684,105 @@ QString CommandHandler::handleGetLibraryStats(const QStringList& parts) {
         .arg(totalClients)
         .arg(activeRentals)
         .arg(overdueRentals);
+}
+
+// Новый обработчик для запроса ДЕТАЛЬНЫХ ОТЧЕТОВ
+QString CommandHandler::handleGetStatisticsReport(const QStringList& parts) {
+    // Проверка количества параметров (команда уже проверена в handleRequest)
+    // Ожидаем: get_statistics_report & reportType & startDate & endDate & optionalFilter
+    if (parts.size() != 5) {
+        qWarning() << "Invalid parameter count for get_statistics_report. Expected 5, got" << parts.size();
+        return "error&Invalid parameters for statistics report (expected 5 parts)\r\n";
+    }
+
+    // Извлекаем параметры
+    QString reportType = parts[1];
+    QString startDateStr = parts[2];
+    QString endDateStr = parts[3];
+    QString optionalFilter = parts[4]; // Может быть пустой строкой
+
+    // TODO: Добавить более строгую валидацию параметров здесь, если нужно
+    // Например, проверить формат дат (хотя SQLite гибок)
+    QDate startDate = QDate::fromString(startDateStr, Qt::ISODate);
+    QDate endDate = QDate::fromString(endDateStr, Qt::ISODate);
+    if (!startDate.isValid() || !endDate.isValid() || startDate > endDate) {
+        return "error&Invalid date format or range (yyyy-MM-dd expected, start <= end)\r\n";
+    }
+    // Валидация reportType? Можно проверить по списку допустимых.
+    // Валидация optionalFilter? Зависит от контекста фильтра.
+
+    qDebug() << "Processing statistics report request. Type:" << reportType
+             << "Start:" << startDateStr << "End:" << endDateStr << "Filter:" << optionalFilter;
+
+    // Получаем экземпляр базы данных
+    database& db = database::get_instance();
+
+    // Вызываем метод БД для получения данных отчета
+    QString reportResult = db.getReportData(reportType, startDateStr, endDateStr, optionalFilter);
+
+    // Анализируем результат, полученный от базы данных
+    if (reportResult.startsWith("error:")) {
+        // Если БД вернула ошибку
+        QString errorMsg = reportResult.mid(6); // Убираем префикс "error:"
+        qWarning() << "Database error generating report" << reportType << ":" << errorMsg;
+        // Формируем ответ об ошибке для клиента
+        return QString("report_data-&%1\r\n").arg(errorMsg);
+    } else if (reportResult.startsWith("chart:")) {
+        // Если БД вернула данные для графика
+        // Формат ответа БД: chart:ТипОтчета&Метка1,Метка2&Значение1,Значение2...
+        QString chartData = reportResult.mid(6); // Убираем префикс "chart:"
+        QStringList chartParts = chartData.split('&'); // Разделяем тип, метки, значения
+        if (chartParts.size() == 3) {
+            QString responseType = chartParts[0];
+            QString labels = chartParts[1];
+            QString values = chartParts[2];
+            // Формируем ответ для клиента для графика
+            return QString("report_chart_data+&%1&%2&%3\r\n").arg(responseType, labels, values);
+        } else {
+            // Ошибка: некорректный формат данных для графика от БД
+            qWarning() << "Invalid chart data format from DB:" << reportResult;
+            return "report_data-&Invalid chart data format from database\r\n";
+        }
+    } else if (reportResult.contains('|')) {
+        // Если БД вернула данные для таблицы (содержит разделитель '|')
+        // Формат ответа БД: Заголовок1,Заголовок2|Данные11,Данные12|Данные21,Данные22...
+        QStringList headerAndData = reportResult.split('|');
+        QString headers = headerAndData.takeFirst(); // Первая часть - заголовки
+        QString data = headerAndData.join('|');     // Остальные части соединяем обратно - это данные
+        // Формируем ответ для клиента для таблицы
+        return QString("report_table_data+&%1&%2&%3\r\n").arg(reportType, headers, data);
+    } else if (reportResult.isEmpty()) {
+        // Если БД вернула пустую строку - значит, данных для отчета нет
+        qDebug() << "No data found for report:" << reportType;
+        // Отправляем клиенту ответ с пустыми данными, но правильным типом,
+        // чтобы он знал, что запрос обработан, но результат пуст.
+        // Отправляем как пустую таблицу.
+        return QString("report_table_data+&%1&& \r\n").arg(reportType); // Тип, Пустые заголовки, Пустые данные
+    } else {
+        // Неожиданный формат ответа от БД (не ошибка, не график, не таблица, не пусто)
+        qWarning() << "Unknown report data format from DB:" << reportResult;
+        return "report_data-&Unknown or invalid report data format received from database\r\n";
+    }
+}
+
+//  Обработчик запроса списка жанров
+QString CommandHandler::handleGetGenresList(const QStringList& parts) {
+    // Параметры parts пока не используются
+    Q_UNUSED(parts);
+    qDebug() << "Processing request for genres list.";
+
+    database& db = database::get_instance();
+    QStringList genres = db.getGenres(); // Вызываем метод БД
+
+    if (genres.isEmpty()) {
+        qDebug() << "No genres found in the database.";
+        // Можно вернуть "+" с пустыми данными, или "-" с сообщением
+        // Вернем "+", чтобы клиент корректно обработал пустой список
+        return QString("genres_list+&\r\n"); // Команда+, пустая строка данных
+    } else {
+        qDebug() << "Returning" << genres.count() << "genres.";
+        // Формат ответа: genres_list+&жанр1,жанр2,жанр3...
+        return QString("genres_list+&%1\r\n").arg(genres.join(','));
+    }
+    // Обработка ошибок произойдет на уровне db.getGenres() или здесь можно добавить try-catch
 }

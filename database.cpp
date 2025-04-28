@@ -1,5 +1,6 @@
 #include "database.h"
-
+#include <QDateTime>
+#include <QVariant> // Для работы со значениями из QSqlQuery
 database* database::p_instance = nullptr;
 database_destroyer database::destroyer;
 
@@ -787,4 +788,240 @@ int database::getOverdueRentalCount() {
     }
     qWarning() << "Failed to get overdue rental count:" << query.lastError();
     return -1; // Ошибка
+}
+
+// Получение списка уникальных жанров из таблицы книг (для фильтра отчетов)
+QStringList database::getGenres() {
+    QStringList genres;
+    // Выбираем уникальные непустые значения из колонки 'genre' и сортируем их
+    QSqlQuery query("SELECT DISTINCT genre FROM books WHERE genre IS NOT NULL AND genre != '' ORDER BY genre ASC");
+    if (!query.exec()) {
+        qWarning() << "Failed to retrieve genres from database:" << query.lastError();
+        return genres; // Возвращаем пустой список в случае ошибки
+    }
+    // Добавляем каждый полученный жанр в список
+    while (query.next()) {
+        genres << query.value(0).toString();
+    }
+    return genres;
+}
+
+// --- Генерация данных для детальных отчетов ---
+// Основной метод для получения данных для различных типов отчетов.
+// Принимает:
+//   - reportType: Строка, идентифицирующая запрашиваемый отчет.
+//   - startDateStr: Начальная дата периода в формате 'yyyy-MM-dd'.
+//   - endDateStr: Конечная дата периода в формате 'yyyy-MM-dd'.
+//   - optionalFilter: Дополнительный фильтр (например, жанр), может быть пустым.
+// Возвращает строку с данными в одном из форматов:
+//   - Таблица: "Заг1,Заг2|Данные11,Данные12|Данные21,Данные22..."
+//   - График:  "chart:ТипОтчета&Метка1,Метка2&Значение1,Значение2..."
+//   - Ошибка:  "error:Сообщение об ошибке"
+//   - Нет данных: "" (пустая строка, либо "Заголовки|" для пустой таблицы)
+QString database::getReportData(const QString& reportType, const QString& startDateStr, const QString& endDateStr, const QString& optionalFilter) {
+    QSqlQuery query(my_database); // Используем соединение текущего объекта database
+    QString sql;                   // Строка для SQL запроса
+    QStringList headers;           // Заголовки для табличного отчета
+    QStringList dataRows;          // Строки данных для табличного отчета (каждая строка - "val1,val2...")
+    QStringList chartLabels;       // Метки для осей/срезов графика
+    QList<qreal> chartValues;      // Числовые значения для графика
+    bool isChartData = false;      // Флаг: true - результат для графика, false - для таблицы
+
+    // Подготовка общих фрагментов SQL для фильтрации по дате.
+    // Важно: Убраны лишние пробелы в конце для корректной конкатенации с AND.
+    QString dateConditionRentals = QString("WHERE DATE(r.start_date) BETWEEN DATE('%1') AND DATE('%2')").arg(startDateStr, endDateStr);
+    QString dateConditionHistory = QString("WHERE DATE(rh.start_date) BETWEEN DATE('%1') AND DATE('%2')").arg(startDateStr, endDateStr); // По дате НАЧАЛА аренды
+    QString dateConditionReturns = QString("WHERE DATE(rh.return_date) BETWEEN DATE('%1') AND DATE('%2')").arg(startDateStr, endDateStr); // По дате ВОЗВРАТА
+
+    // Подготовка фрагмента SQL для опционального фильтра (например, по жанру)
+    // Важно: Используем prepare/bindValue для безопасности от SQL-инъекций!
+    QString filterClause;    // Часть SQL-запроса с AND для фильтра
+    bool useFilterBinding = !optionalFilter.isEmpty(); // Флаг, нужно ли биндить значение фильтра
+
+    qDebug() << "[Database] getReportData: Initial useFilterBinding=" << useFilterBinding << "for filter:" << optionalFilter;
+
+    if (useFilterBinding) {
+        // Явно проверяем типы отчетов, к которым применим СТАНДАРТНЫЙ фильтр по books.genre (алиас 'b')
+        if (reportType == "Популярность книг (Топ-10)" ||
+            reportType == "Текущие просрочки" ||
+            reportType == "Активность (Выдачи/Возвраты)") // <<< ДОБАВЛЯЕМ "Активность" СЮДА
+        {
+            filterClause = " AND b.genre = :filterValue ";
+            // useFilterBinding остается true
+            qDebug() << "[Database] Applying standard genre filter (b.genre) for report:" << reportType;
+        }
+        // Явно проверяем типы отчетов с ДРУГОЙ логикой фильтра
+        else if (reportType == "Активные читатели (Топ-10)")
+        {
+            filterClause = " AND rh.book_id IN (SELECT id FROM books WHERE genre = :filterValue) ";
+            // useFilterBinding остается true
+            qDebug() << "[Database] Applying specific genre filter (reader activity) for report:" << reportType;
+        }
+        // Явно проверяем типы отчетов, где фильтр НЕ НУЖЕН (они сами группируют по жанрам)
+        else if (reportType == "Популярность жанров" || reportType == "Состав фонда по жанрам")
+        {
+            useFilterBinding = false; // Фильтр здесь не применяется
+            qDebug() << "[Database] Genre filter is not applicable for report:" << reportType;
+        }
+        // Обработка всех остальных (неизвестных или новых) типов отчетов
+        else
+        {
+            qWarning() << "Genre filter application is undefined for report type:" << reportType << "- Disabling filter.";
+            useFilterBinding = false; // Безопаснее отключить фильтр
+        }
+    }
+
+    // =============================================
+    // Основной блок: Определение и выполнение SQL-запроса
+    // =============================================
+    try {
+        if (reportType == "Активность (Выдачи/Возвраты)") {
+            isChartData = true;
+            chartLabels << "Выдачи" << "Возвраты";
+
+            // --- Запрос для ВЫДАЧ ---
+            sql = "SELECT COUNT(r.id) FROM rentals r "; // Базовый запрос
+            QString whereClauseRentals = dateConditionRentals; // Начинается с WHERE date...
+
+            if (useFilterBinding) {
+                sql += "JOIN books b ON r.book_id = b.id "; // Добавляем JOIN ТОЛЬКО при фильтре
+                whereClauseRentals += filterClause;        // Добавляем условие жанра к WHERE (filterClause начинается с AND)
+            }
+            sql += whereClauseRentals; // Добавляем собранное условие WHERE
+
+            query.prepare(sql);
+            if (useFilterBinding) {
+                query.bindValue(":filterValue", optionalFilter);
+            }
+            if (!query.exec()) {
+                qWarning() << "SQL Error (Rentals Count):" << query.lastError().text() << "Query:" << query.lastQuery();
+                throw query.lastError(); // Передаем ошибку дальше
+            }
+            chartValues << (query.next() ? query.value(0).toReal() : 0.0);
+
+            // --- Запрос для ВОЗВРАТОВ ---
+            sql = "SELECT COUNT(rh.id) FROM rental_history rh "; // Базовый запрос
+            QString whereClauseHistory = dateConditionReturns; // Начинается с WHERE date...
+
+            if (useFilterBinding) {
+                sql += "JOIN books b ON rh.book_id = b.id "; // Добавляем JOIN ТОЛЬКО при фильтре
+                whereClauseHistory += filterClause;        // Добавляем условие жанра к WHERE (filterClause начинается с AND)
+            }
+            sql += whereClauseHistory; // Добавляем собранное условие WHERE
+
+            query.prepare(sql);
+            if (useFilterBinding) {
+                query.bindValue(":filterValue", optionalFilter);
+            }
+            if (!query.exec()) {
+                qWarning() << "SQL Error (History Count):" << query.lastError().text() << "Query:" << query.lastQuery();
+                throw query.lastError(); // Передаем ошибку дальше
+            }
+            chartValues << (query.next() ? query.value(0).toReal() : 0.0);
+
+        }  else if (reportType == "Популярность книг (Топ-10)") {
+            headers << "Название книги" << "Автор" << "Кол-во выдач";
+            sql = QString( "SELECT b.title, b.author, COUNT(rh.book_id) as cnt FROM rental_history rh JOIN books b ON rh.book_id = b.id ")
+                  + dateConditionHistory + (useFilterBinding ? filterClause : "") + // Добавляем фильтр, если нужно
+                  " GROUP BY rh.book_id ORDER BY cnt DESC LIMIT 10";
+            query.prepare(sql); // Готовим запрос
+            if(useFilterBinding) query.bindValue(":filterValue", optionalFilter); // Биндим значение фильтра
+            if (!query.exec()) throw query.lastError();
+            while (query.next()) {
+                dataRows << QString("%1,%2,%3").arg(query.value(0).toString(), query.value(1).toString(), query.value(2).toString());
+            }
+
+        } else if (reportType == "Популярность жанров") {
+            isChartData = true;
+            // Запрос не зависит от optionalFilter (т.к. группируем по жанрам)
+            sql = QString( "SELECT b.genre, COUNT(rh.book_id) as cnt FROM rental_history rh JOIN books b ON rh.book_id = b.id ")
+                  + dateConditionHistory + // Должен быть WHERE
+                  " AND b.genre IS NOT NULL AND b.genre != '' GROUP BY b.genre ORDER BY cnt DESC"; // Используем AND
+            if (!query.exec(sql)) throw query.lastError();
+            while (query.next()) {
+                chartLabels << query.value(0).toString();
+                chartValues << query.value(1).toReal();
+            }
+
+        } else if (reportType == "Активные читатели (Топ-10)") {
+            headers << "Логин читателя" << "Email" << "Кол-во взятых книг";
+            sql = QString( "SELECT u.login, u.email, COUNT(rh.user_id) as cnt FROM rental_history rh JOIN users u ON rh.user_id = u.id ")
+                  + dateConditionHistory + // Должен быть WHERE
+                  (useFilterBinding ? filterClause : "") + // Добавляем фильтр, если нужно
+                  " AND u.role = 'client' GROUP BY rh.user_id ORDER BY cnt DESC LIMIT 10"; // Используем AND
+            query.prepare(sql); // Готовим запрос
+            if(useFilterBinding) query.bindValue(":filterValue", optionalFilter); // Биндим значение фильтра
+            if (!query.exec()) throw query.lastError();
+            while (query.next()) {
+                dataRows << QString("%1,%2,%3").arg(query.value(0).toString(), query.value(1).toString(), query.value(2).toString());
+            }
+
+        } else if (reportType == "Текущие просрочки") {
+            headers << "ID аренды" << "Логин" << "Email" << "Название книги" << "Дата выдачи" << "Дата возврата" << "Дней просрочено";
+            sql = QString( "SELECT r.id, u.login, u.email, b.title, r.start_date, r.end_date, "
+                          "CAST(JULIANDAY('now', 'start of day') - JULIANDAY(r.end_date, 'start of day') AS INTEGER) as overdue_days "
+                          "FROM rentals r JOIN users u ON r.user_id = u.id JOIN books b ON r.book_id = b.id "
+                          "WHERE DATE(r.end_date) < DATE('now') " // Первое условие с WHERE
+                          ) + (useFilterBinding ? filterClause : "") + // Добавляем фильтр с AND, если нужно
+                  " ORDER BY overdue_days DESC, u.login";
+            query.prepare(sql); // Готовим запрос
+            if(useFilterBinding) query.bindValue(":filterValue", optionalFilter); // Биндим значение фильтра
+            if (!query.exec()) throw query.lastError();
+            while (query.next()) {
+                dataRows << QString("%1,%2,%3,%4,%5,%6,%7").arg(query.value(0).toString(), query.value(1).toString(), query.value(2).toString(), query.value(3).toString(), query.value(4).toString(), query.value(5).toString(), query.value(6).toString());
+            }
+
+        } else if (reportType == "Состав фонда по жанрам") {
+            isChartData = true;
+            // Запрос не зависит от дат и фильтра
+            sql = "SELECT genre, COUNT(*) as cnt FROM books WHERE genre IS NOT NULL AND genre != '' GROUP BY genre ORDER BY cnt DESC";
+            if (!query.exec(sql)) throw query.lastError();
+            while (query.next()) {
+                chartLabels << query.value(0).toString();
+                chartValues << query.value(1).toReal();
+            }
+        }
+        else {
+            qWarning() << "Unknown report type requested from database:" << reportType;
+            return "error:Unknown report type requested.";
+        }
+
+    } catch (const QSqlError& error) {
+        qCritical() << "SQL Error generating report [" << reportType << "]:" << error.text() << "Query:" << query.lastQuery();
+        return "error:" + error.text(); // Возвращаем текст ошибки SQL
+    } catch (const std::exception& e) {
+        qCritical() << "Standard Exception generating report [" << reportType << "]:" << e.what();
+        return "error:Internal server error during report generation.";
+    }
+
+    // =============================================
+    // Формирование строки ответа для CommandHandler
+    // =============================================
+    if (isChartData) {
+        // --- Формируем ответ для графика ---
+        if (chartLabels.isEmpty() || chartValues.isEmpty()) {
+            // Хотя запрос мог выполниться успешно, данных для графика нет
+            return ""; // Возвращаем пустую строку
+        }
+        QStringList valueStrings;
+        for(qreal v : chartValues) {
+            valueStrings << QString::number(v, 'f', 2); // Форматируем число
+        }
+        return QString("chart:%1&%2&%3").arg(reportType, chartLabels.join(','), valueStrings.join(','));
+    } else {
+        // --- Формируем ответ для таблицы ---
+        if (headers.isEmpty()) {
+            // Ситуация не должна возникать, если логика выше корректна, но для безопасности:
+            qWarning() << "Report [" << reportType << "] is marked as table data, but headers are empty.";
+            return dataRows.isEmpty() ? "" : ("|" + dataRows.join('|')); // Отдаем данные без заголовков или ничего
+        }
+
+        if (dataRows.isEmpty()) {
+            // Если есть заголовки, но нет строк данных
+            return headers.join(',') + "|"; // Формат "Заголовки|" означает пустую таблицу
+        } else {
+            // Если есть и заголовки, и строки данных
+            return headers.join(',') + "|" + dataRows.join('|');
+        }
+    }
 }
